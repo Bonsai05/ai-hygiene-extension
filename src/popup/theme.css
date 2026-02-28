@@ -1,0 +1,125 @@
+:root {
+    --font-size: 16px;
+
+    /* Light Wireframe UI Color System */
+    --wireframe-bg: #f8f9fa;
+    --wireframe-surface: #ffffff;
+    --wireframe-border: #1a1a1a;
+    --wireframe-text: #2a2a2a;
+    --wireframe-text-muted: #6b7280;
+
+    /* Semantic Colors */
+    --wireframe-success: #22c55e;
+    --wireframe-danger: #f87171;
+    --wireframe-warning: #fbbf24;
+
+    --background: var(--wireframe-bg);
+    --foreground: var(--wireframe-text);
+    --card: var(--wireframe-surface);
+    --card-foreground: var(--wireframe-text);
+    --popover: var(--wireframe-surface);
+    --popover-foreground: var(--wireframe-text);
+
+    /* The primary accent is the black wireframe border color in this design */
+    --primary: var(--wireframe-border);
+    --primary-foreground: var(--wireframe-surface);
+
+    --secondary: #e5e7eb;
+    --secondary-foreground: var(--wireframe-text);
+    --muted: #f3f4f6;
+    --muted-foreground: var(--wireframe-text-muted);
+    --accent: #f3f4f6;
+    --accent-foreground: var(--wireframe-text);
+    --destructive: var(--wireframe-danger);
+    --destructive-foreground: #ffffff;
+
+    /* Thick dark borders are key to this look */
+    --border: var(--wireframe-border);
+    --input: var(--wireframe-border);
+    --input-background: var(--wireframe-surface);
+    --switch-background: var(--wireframe-border);
+    --ring: var(--wireframe-border);
+
+    --font-weight-medium: 600;
+    --font-weight-normal: 400;
+
+    --radius: 0px;
+    /* Sharp corners for wireframe look */
+}
+
+@layer base {
+    * {
+        border-color: var(--border);
+        outline-color: color-mix(in srgb, var(--ring) 50%, transparent);
+    }
+
+    body {
+        background-color: var(--background);
+        color: var(--foreground);
+        font-family: 'Azeret Mono', monospace;
+        width: 380px;
+        height: 600px;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+    }
+
+    /**
+  * Default typography styles for HTML elements (h1-h4, p, label, button, input).
+  * These are in @layer base, so Tailwind utility classes (like text-sm, text-lg) automatically override them.
+  */
+
+    html {
+        font-size: var(--font-size);
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+        font-family: 'Syne', sans-serif;
+    }
+
+    h1 {
+        font-size: var(--text-2xl);
+        font-weight: 800;
+        line-height: 1.2;
+    }
+
+    h2 {
+        font-size: var(--text-xl);
+        font-weight: 700;
+        line-height: 1.3;
+    }
+
+    h3 {
+        font-size: var(--text-lg);
+        font-weight: 700;
+        line-height: 1.4;
+    }
+
+    h4 {
+        font-size: var(--text-base);
+        font-weight: 600;
+        line-height: 1.5;
+    }
+
+    label {
+        font-size: var(--text-base);
+        font-weight: var(--font-weight-medium);
+        line-height: 1.5;
+    }
+
+    button {
+        font-size: var(--text-base);
+        font-weight: var(--font-weight-medium);
+        line-height: 1.5;
+        font-family: 'Syne', sans-serif;
+    }
+
+    input {
+        font-size: var(--text-base);
+        font-weight: var(--font-weight-normal);
+        line-height: 1.5;
+    }
+}
