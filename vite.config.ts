@@ -1,15 +1,29 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { resolve } from 'path';
+import { viteStaticCopy } from 'vite-plugin-static-copy';
+import path from 'path';
 
 // https://vitejs.dev/config/
 export default defineConfig({
-    plugins: [react()],
+    plugins: [
+        react(),
+        viteStaticCopy({
+            targets: [
+                {
+                    src: 'node_modules/@huggingface/transformers/dist/*.jsep.wasm',
+                    dest: 'assets',
+                },
+            ],
+        }),
+    ],
     build: {
         outDir: 'dist',
         rollupOptions: {
             input: {
-                popup: resolve(__dirname, 'index.html'),
+                popup: path.resolve(__dirname, 'index.html'),
+                background: path.resolve(__dirname, 'src/background.ts'),
+                'content-script': path.resolve(__dirname, 'src/content-script.ts'),
+                offscreen: path.resolve(__dirname, 'public/offscreen.html'),
             },
             output: {
                 entryFileNames: 'assets/[name].js',
@@ -17,5 +31,12 @@ export default defineConfig({
                 assetFileNames: 'assets/[name].[ext]',
             },
         },
+    },
+    optimizeDeps: {
+        exclude: ['@huggingface/transformers'],
+    },
+    resolve: {
+        browserField: false,
+        mainFields: ['module', 'jsnext:main', 'jsnext'],
     },
 });

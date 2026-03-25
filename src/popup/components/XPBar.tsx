@@ -24,7 +24,7 @@ export function XPProgressBar({ currentXP, maxXP, level }: XPProgressBarProps) {
                     className="h-full border-r-2 border-border"
                     style={{
                         width: `${percentage}%`,
-                        backgroundColor: '#3a3a3a',
+                        backgroundColor: 'hsl(var(--primary))',
                         backgroundImage: 'repeating-linear-gradient(-45deg, rgba(0,0,0,0.1), rgba(0,0,0,0.1) 6px, transparent 6px, transparent 12px)'
                     }}
                 />

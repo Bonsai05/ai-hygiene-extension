@@ -1,9 +1,9 @@
-import { Lightbulb, Sparkles } from 'lucide-react';
+import { Lightbulb, Sparkles, AlertTriangle } from 'lucide-react';
 
 export interface QuickTip {
     id: string;
     text: string;
-    type: 'info' | 'success';
+    type: 'info' | 'success' | 'warning';
 }
 
 interface QuickTipsProps {
@@ -14,11 +14,13 @@ export function QuickTips({ tips }: QuickTipsProps) {
     const colorMap = {
         info: 'border-warning text-warning',
         success: 'border-success text-success',
+        warning: 'border-destructive text-destructive',
     };
 
     const IconMap = {
         info: Lightbulb,
         success: Sparkles,
+        warning: AlertTriangle,
     };
 
     return (

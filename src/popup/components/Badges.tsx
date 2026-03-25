@@ -1,9 +1,9 @@
-import { Shield, Lock, Eye, Zap, Award, LockKeyhole } from 'lucide-react';
+import { Shield, Lock, Eye, Zap, Award, LockKeyhole, CheckCircle, AlertCircle } from 'lucide-react';
 
 export interface Badge {
     id: string;
     name: string;
-    icon: 'shield' | 'lock' | 'eye' | 'key' | 'zap' | 'award';
+    icon: 'shield' | 'lock' | 'eye' | 'key' | 'zap' | 'award' | 'check' | 'alert';
     earned: boolean;
     description: string;
 }
@@ -19,6 +19,8 @@ const iconMap = {
     key: LockKeyhole,
     zap: Zap,
     award: Award,
+    check: CheckCircle,
+    alert: AlertCircle,
 };
 
 export function BadgeGrid({ badges }: BadgeGridProps) {

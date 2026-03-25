@@ -41,6 +41,14 @@ export default {
                     DEFAULT: "var(--card)",
                     foreground: "var(--card-foreground)",
                 },
+                warning: {
+                    DEFAULT: "var(--warning)",
+                    foreground: "var(--warning-foreground)",
+                },
+                success: {
+                    DEFAULT: "var(--success)",
+                    foreground: "var(--success-foreground)",
+                },
             },
             borderRadius: {
                 lg: "var(--radius)",

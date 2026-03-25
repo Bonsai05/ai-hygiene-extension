@@ -2,14 +2,55 @@
     "manifest_version": 3,
     "name": "AI Hygiene Companion",
     "version": "1.0",
+    "description": "Privacy-First AI Digital Hygiene Companion for safe browsing",
     "action": {
         "default_popup": "index.html"
     },
     "permissions": [
         "storage",
-        "activeTab"
+        "activeTab",
+        "webRequest",
+        "webNavigation",
+        "scripting",
+        "notifications",
+        "offscreen"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "background": {
+        "service_worker": "assets/background.js",
+        "type": "module"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "assets/content-script.js"
+            ],
+            "run_at": "document_idle"
+        }
     ],
     "icons": {
+        "16": "icon.png",
+        "32": "icon.png",
+        "48": "icon.png",
         "128": "icon.png"
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "assets/*.jsep.wasm",
+                "offscreen.html"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        }
+    ],
+    "content_security_policy": {
+        "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self';"
     }
 }

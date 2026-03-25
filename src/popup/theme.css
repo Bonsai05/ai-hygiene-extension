@@ -33,6 +33,11 @@
     --destructive: var(--wireframe-danger);
     --destructive-foreground: #ffffff;
 
+    --warning: var(--wireframe-warning);
+    --warning-foreground: #ffffff;
+    --success: var(--wireframe-success);
+    --success-foreground: #ffffff;
+
     /* Thick dark borders are key to this look */
     --border: var(--wireframe-border);
     --input: var(--wireframe-border);
