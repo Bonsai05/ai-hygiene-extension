@@ -119,6 +119,7 @@ async function notifyXpGain(stats: UserStats, xpAmount: number, reason: string) 
 // --- Combined heuristic + ML analysis ---
 // UPDATED: Now accepts an optional tabId so we know where to inject the warning banner
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
+    if (!url || !url.startsWith("http")) return;
     if (visitedUrls.has(url)) return;
     visitedUrls.add(url);
 
