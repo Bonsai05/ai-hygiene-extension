@@ -1,344 +1,372 @@
-// Background script for Chrome Extension – Service Worker (MV3)
-// Handles risk detection, XP awards, badge notifications, and popup communication
+// src/background.ts — Final fixed version
+// Changes vs previous draft:
+//   1. Uses applyDangerPenalty() from gamification (single source of truth for XP logic)
+//   2. Tracks "pending danger tabs" — if user navigates away from a danger page,
+//      awards DANGER_AVOIDED XP instead of penalising them
+//   3. chrome.storage.session used for visitedUrls (survives SW sleep/wake cycles)
+//   4. notifyXpGain / notifyXpLoss only fire when amount > 0
 
 import {
-    loadStats,
-    saveStats,
-    updateStats,
-    loadRiskLevel,
-    saveRiskLevel,
-    type UserStats,
+  loadStats,
+  saveStats,
+  updateStats,
+  loadRiskLevel,
+  saveRiskLevel,
+  type UserStats,
 } from "./lib/storage";
-import { analyzeUrl, contentRiskFromSignals, type RiskAnalysis } from "./lib/risk-detection";
+import { analyzeUrl, contentRiskFromSignals } from "./lib/risk-detection";
 import {
-    awardSafeBrowsingXp,
-    awardDangerAvoidedXp,
-    onPanicButtonClicked,
-    onRecoveryCompleted,
-    getLevelTitle,
-    getXpToNextLevel,
-    XP_REWARDS,
+  awardSafeBrowsingXp,
+  awardDangerAvoidedXp,
+  applyDangerPenalty,
+  onPanicButtonClicked,
+  onRecoveryCompleted,
+  getLevelTitle,
+  getXpToNextLevel,
+  XP_REWARDS,
 } from "./lib/gamification";
 import { showBrowserNotification } from "./lib/notifications";
 
-// --- ML Model Integration (FastAPI Backend) ---
-// The AI phishing detection now runs locally on the native machine to leverage
-// the AMD Ryzen AI NPU/CPU hardware via the local Python FastAPI server.
+// ---------------------------------------------------------------------------
+// Persistent visited-URL deduplication
+// chrome.storage.session survives SW restarts but clears on browser close.
+// ---------------------------------------------------------------------------
+const VISITED_KEY = "visitedUrls";
+const DANGER_TABS_KEY = "dangerTabs"; // tabId -> url mapping
 
+async function wasRecentlyVisited(url: string): Promise<boolean> {
+  const result = await chrome.storage.session.get([VISITED_KEY]);
+  const list: string[] = result[VISITED_KEY] ?? [];
+  return list.includes(url);
+}
+
+async function markVisited(url: string): Promise<void> {
+  const result = await chrome.storage.session.get([VISITED_KEY]);
+  const list: string[] = result[VISITED_KEY] ?? [];
+  if (!list.includes(url)) {
+    await chrome.storage.session.set({ [VISITED_KEY]: [...list, url].slice(-300) });
+  }
+}
+
+async function clearVisited(): Promise<void> {
+  await chrome.storage.session.remove([VISITED_KEY, DANGER_TABS_KEY]);
+}
+
+async function markTabAsDanger(tabId: number, url: string): Promise<void> {
+  const result = await chrome.storage.session.get([DANGER_TABS_KEY]);
+  const tabs: Record<number, string> = result[DANGER_TABS_KEY] ?? {};
+  tabs[tabId] = url;
+  await chrome.storage.session.set({ [DANGER_TABS_KEY]: tabs });
+}
+
+async function clearDangerTab(tabId: number): Promise<string | null> {
+  const result = await chrome.storage.session.get([DANGER_TABS_KEY]);
+  const tabs: Record<number, string> = result[DANGER_TABS_KEY] ?? {};
+  const prevUrl = tabs[tabId] ?? null;
+  if (prevUrl) {
+    delete tabs[tabId];
+    await chrome.storage.session.set({ [DANGER_TABS_KEY]: tabs });
+  }
+  return prevUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Backend ML integration
+// ---------------------------------------------------------------------------
 interface BackendMLResult {
-    level: "safe" | "warning" | "danger";
-    score: number;
-    provider: string;
+  level: "safe" | "warning" | "danger";
+  score: number;
+  provider: string;
 }
 
 async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | null> {
-    try {
-        const response = await fetch("http://127.0.0.1:8000/api/analyze", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ url: url })
-        });
-
-        if (!response.ok) throw new Error("Backend offline");
-
-        const data = await response.json();
-        console.log("[AI Hygiene] Backend Result:", data);
-
-        // Map the numerical score to a risk level for the UI
-        const score = data.phishing_score;
-        let level: "safe" | "warning" | "danger" = "safe";
-
-        if (score >= 0.7) {
-            level = "danger";
-        } else if (score >= 0.3) {
-            level = "warning";
-        }
-
-        return {
-            level,
-            score,
-            provider: data.provider
-        };
-
-    } catch (error) {
-        console.warn("[AI Hygiene] Failed to reach local backend. Falling back to heuristics:", error);
-        return null;
-    }
+  try {
+    const response = await fetch("http://127.0.0.1:8000/analyze/url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!response.ok) throw new Error("Backend offline");
+    const data = await response.json();
+    const score: number = data.phishing_score ?? data.score / 100 ?? 0;
+    let level: "safe" | "warning" | "danger" = "safe";
+    if (score >= 0.7) level = "danger";
+    else if (score >= 0.3) level = "warning";
+    return { level, score, provider: data.provider ?? "Local FastAPI" };
+  } catch {
+    return null;
+  }
 }
 
-
-// --- Risk detection state ---
+// ---------------------------------------------------------------------------
+// Risk level state
+// ---------------------------------------------------------------------------
 let currentRiskLevel: "safe" | "warning" | "danger" = "safe";
 let lastAnalyzedUrl = "";
 
-// Track whether we've already awarded XP for this URL
-const visitedUrls = new Set<string>();
-
-
-// --- Set risk level and notify popup ---
 function setRiskLevel(level: "safe" | "warning" | "danger") {
-    currentRiskLevel = level;
-    saveRiskLevel(level);
-    chrome.runtime.sendMessage({ type: "riskUpdate", level }).catch(() => {
-        // No active popup to receive — that's ok
-    });
+  currentRiskLevel = level;
+  saveRiskLevel(level);
+  chrome.runtime.sendMessage({ type: "riskUpdate", level }).catch(() => {});
 }
 
-
-// --- XP notification ---
-async function notifyXpGain(stats: UserStats, xpAmount: number, reason: string) {
-    const { current: currentInLevel, needed: neededForLevel } = getXpToNextLevel(stats.xp, stats.level);
-    const levelTitle = getLevelTitle(stats.level);
-    const levelUp = `Level ${stats.level} ${levelTitle}`;
-
-    try {
-        chrome.runtime.sendMessage({
-            type: "xpGain",
-            xpAmount,
-            reason,
-            totalXp: stats.xp,
-            level: stats.level,
-            levelTitle,
-            xpProgress: { current: currentInLevel, max: neededForLevel },
-        });
-    } catch {
-        // no active popup
-    }
-
-    if (xpAmount > 0) {
-        await showBrowserNotification(
-            `+${xpAmount} XP — ${reason}`,
-            `${levelUp} | ${currentInLevel}/${neededForLevel} XP to next level`,
-        );
-    }
+// ---------------------------------------------------------------------------
+// XP notifications
+// ---------------------------------------------------------------------------
+async function notifyXpGain(stats: UserStats, amount: number, reason: string): Promise<void> {
+  if (amount <= 0) return;
+  const { current, needed } = getXpToNextLevel(stats.xp, stats.level);
+  const title = getLevelTitle(stats.level);
+  chrome.runtime.sendMessage({
+    type: "xpGain",
+    xpAmount: amount,
+    reason,
+    totalXp: stats.xp,
+    level: stats.level,
+    levelTitle: title,
+    xpProgress: { current, max: needed },
+  }).catch(() => {});
+  await showBrowserNotification(
+    `+${amount} XP — ${reason}`,
+    `Level ${stats.level} ${title} | ${current}/${needed} XP to next level`
+  );
 }
 
+async function notifyXpLoss(stats: UserStats, amount: number, reason: string): Promise<void> {
+  if (amount <= 0) return;
+  const { current, needed } = getXpToNextLevel(stats.xp, stats.level);
+  const title = getLevelTitle(stats.level);
+  chrome.runtime.sendMessage({
+    type: "xpLoss",
+    xpAmount: amount,
+    reason,
+    totalXp: stats.xp,
+    level: stats.level,
+    levelTitle: title,
+    xpProgress: { current, max: needed },
+  }).catch(() => {});
+  await showBrowserNotification(
+    `-${amount} XP — ${reason}`,
+    `Level ${stats.level} ${title} | ${current}/${needed} XP to next level`
+  );
+}
 
-// --- Combined heuristic + ML analysis ---
-// UPDATED: Now accepts an optional tabId so we know where to inject the warning banner
+// ---------------------------------------------------------------------------
+// Warning banner injection
+// ---------------------------------------------------------------------------
+function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
+  chrome.scripting.executeScript({
+    target: { tabId },
+    func: (riskLevel: string) => {
+      if (document.getElementById("ai-hygiene-warning-banner")) return;
+      const banner = document.createElement("div");
+      banner.id = "ai-hygiene-warning-banner";
+      Object.assign(banner.style, {
+        position: "fixed", top: "0", left: "0", width: "100%",
+        backgroundColor: riskLevel === "danger" ? "#ef4444" : "#f59e0b",
+        color: "white", padding: "16px", textAlign: "center",
+        fontFamily: "monospace", fontSize: "18px", fontWeight: "bold",
+        zIndex: "9999999", boxShadow: "0 4px 6px rgba(0,0,0,0.3)",
+      });
+      banner.innerText = riskLevel === "danger"
+        ? "🚨 AI HYGIENE ALERT: This site has been flagged as a severe phishing risk!"
+        : "⚠️ AI HYGIENE WARNING: Proceed with caution. Do not share sensitive info here.";
+      document.body.prepend(banner);
+    },
+    args: [level],
+  }).catch(err => console.error("[AI Hygiene] Could not inject banner:", err));
+}
+
+// ---------------------------------------------------------------------------
+// Core: analyse URL + award / deduct XP
+// ---------------------------------------------------------------------------
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
-    if (visitedUrls.has(url)) return;
-    visitedUrls.add(url);
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return;
 
-    // Run both analyses in parallel — ML is authoritative, heuristic is fallback
-    const [heuristicResult, mlResult] = await Promise.all([
-        Promise.resolve(analyzeUrl(url)),             // Heuristic (always available)
-        analyzeUrlWithBackend(url).catch(() => null), // Local API Backend
-    ]);
+  // If this tab was previously showing a danger page and is navigating somewhere
+  // new, the user avoided it — reward them before processing the new URL.
+  if (tabId !== undefined) {
+    const prevDangerUrl = await clearDangerTab(tabId);
+    if (prevDangerUrl && prevDangerUrl !== url) {
+      const stats = await loadStats();
+      const updated = await awardDangerAvoidedXp(stats);
+      await saveStats(updated);
+      await notifyXpGain(updated, XP_REWARDS.DANGER_AVOIDED, "Navigated away from a dangerous site");
+    }
+  }
 
-    // Determine final risk level: ML wins if available
-    let finalLevel: "safe" | "warning" | "danger" = heuristicResult.level;
-    if (mlResult) {
-        // ML overrides heuristic if it detects danger, otherwise combine
-        if (mlResult.level === "danger") {
-            finalLevel = "danger";
-        } else if (mlResult.level === "warning" && finalLevel !== "danger") {
-            finalLevel = "warning";
-        }
-        console.info(`[AI Hygiene] ML risk: ${mlResult.level} (${mlResult.score.toFixed(3)}), Heuristic: ${heuristicResult.level} [Hardware: ${mlResult.provider}]`);
+  if (await wasRecentlyVisited(url)) return;
+  await markVisited(url);
+
+  const [heuristicResult, mlResult] = await Promise.all([
+    Promise.resolve(analyzeUrl(url)),
+    analyzeUrlWithBackend(url).catch(() => null),
+  ]);
+
+  let finalLevel: "safe" | "warning" | "danger" = heuristicResult.level;
+  if (mlResult) {
+    if (mlResult.level === "danger") finalLevel = "danger";
+    else if (mlResult.level === "warning" && finalLevel !== "danger") finalLevel = "warning";
+    console.info(
+      `[AI Hygiene] ML: ${mlResult.level} (${mlResult.score.toFixed(3)}) | ` +
+      `Heuristic: ${heuristicResult.level} | Hardware: ${mlResult.provider}`
+    );
+  }
+
+  chrome.runtime.sendMessage({
+    type: "mlRiskResult",
+    level: finalLevel,
+    mlScore: mlResult?.score ?? null,
+    modelVersion: mlResult?.provider ?? "Local CPU/Heuristic",
+  }).catch(() => {});
+
+  if (tabId !== undefined && (finalLevel === "danger" || finalLevel === "warning")) {
+    injectWarningBanner(tabId, finalLevel);
+  }
+
+  try {
+    const stats = await loadStats();
+
+    if (finalLevel === "danger") {
+      if (tabId !== undefined) await markTabAsDanger(tabId, url);
+      const updated = await applyDangerPenalty(stats);
+      await saveStats(updated);
+      await notifyXpLoss(updated, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
+      setRiskLevel("danger");
+      return;
     }
 
-    // Send ML result to popup for display
-    chrome.runtime.sendMessage({
-        type: "mlRiskResult",
-        level: finalLevel,
-        mlScore: mlResult?.score ?? null,
-        modelVersion: mlResult?.provider ?? "Local CPU/Heuristic", // Show the hardware provider in the UI!
-    }).catch(() => { });
+    let updated: UserStats;
 
-    // --- NEW: INJECT BANNER IF DANGEROUS OR WARNING ---
-    if ((finalLevel === "danger" || finalLevel === "warning") && tabId) {
-        chrome.scripting.executeScript({
-            target: { tabId: tabId },
-            func: (level) => {
-                // This code runs INSIDE the dangerous webpage!
-                // Prevent duplicate banners from stacking up
-                if (document.getElementById('ai-hygiene-warning-banner')) return;
-
-                const banner = document.createElement('div');
-                banner.id = 'ai-hygiene-warning-banner';
-                banner.style.position = 'fixed';
-                banner.style.top = '0';
-                banner.style.left = '0';
-                banner.style.width = '100%';
-                banner.style.backgroundColor = level === 'danger' ? '#ef4444' : '#f59e0b';
-                banner.style.color = 'white';
-                banner.style.padding = '16px';
-                banner.style.textAlign = 'center';
-                banner.style.fontFamily = 'monospace';
-                banner.style.fontSize = '18px';
-                banner.style.fontWeight = 'bold';
-                banner.style.zIndex = '9999999';
-                banner.style.boxShadow = '0 4px 6px rgba(0,0,0,0.3)';
-
-                const message = level === 'danger'
-                    ? '🚨 AI HYGIENE ALERT: This site has been flagged as a severe phishing risk! 🚨'
-                    : '⚠️ AI HYGIENE WARNING: Proceed with caution. Do not share sensitive info here. ⚠️';
-
-                banner.innerText = message;
-                document.body.prepend(banner);
-            },
-            args: [finalLevel]
-        }).catch(err => console.error("[AI Hygiene] Could not inject banner:", err));
+    if (finalLevel === "warning") {
+      updated = await awardSafeBrowsingXp(stats);
+      await saveStats(updated);
+      if (updated.safeBrowsingStreak > 1) {
+        await notifyXpGain(updated, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
+      }
+    } else {
+      updated = await awardSafeBrowsingXp(stats);
+      await saveStats(updated);
+      await notifyXpGain(updated, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
     }
 
-
-    if (finalLevel === "danger" && currentRiskLevel !== "danger") {
-        setRiskLevel("danger");
-        return;
+    // Announce newly-earned badges
+    const newBadges = updated.badges.filter(
+      (b, i) => b.earned && (!stats.badges[i] || !stats.badges[i].earned)
+    );
+    for (const badge of newBadges) {
+      await showBrowserNotification(
+        `Badge Earned: ${badge.name}`,
+        `${badge.description}\n+${XP_REWARDS.BADGE_EARNED} XP bonus!`
+      );
     }
 
-    try {
-        const stats = await loadStats();
-        let updated: UserStats;
-
-        if (finalLevel === "danger") {
-            setRiskLevel("danger");
-            return;
-        } else if (finalLevel === "warning") {
-            updated = await awardSafeBrowsingXp(stats);
-            if (updated.safeBrowsingStreak > 1) {
-                await notifyXpGain(updated, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
-            }
-        } else {
-            updated = await awardSafeBrowsingXp(stats);
-            await notifyXpGain(updated, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
-        }
-
-        const newBadges = updated.badges.filter(
-            (b, i) => b.earned && (!stats.badges[i] || !stats.badges[i].earned)
-        );
-        for (const badge of newBadges) {
-            await showBrowserNotification(
-                `Badge Earned: ${badge.name}`,
-                `${badge.description}\n+${XP_REWARDS.BADGE_EARNED} XP bonus!`,
-            );
-        }
-
-        setRiskLevel(finalLevel);
-    } catch (e) {
-        console.error("[AI Hygiene] Error analyzing page:", e);
-        setRiskLevel("safe");
-    }
+    setRiskLevel(finalLevel);
+  } catch (e) {
+    console.error("[AI Hygiene] Error in analyzeAndAward:", e);
+    setRiskLevel("safe");
+  }
 }
 
-
-// --- Tab event handlers ---
+// ---------------------------------------------------------------------------
+// Tab event listeners
+// ---------------------------------------------------------------------------
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    // UPDATED: Now passing tabId to analyzeAndAward
-    if (changeInfo.url && tab?.active) {
-        const url = changeInfo.url;
-        lastAnalyzedUrl = url;
-        analyzeAndAward(url, tabId);
-    } else if (changeInfo.status === "complete" && tab?.active && tab.url) {
-        const url = tab.url;
-        if (url !== lastAnalyzedUrl) {
-            lastAnalyzedUrl = url;
-            analyzeAndAward(url, tabId);
-        }
+  if (changeInfo.url && tab?.active) {
+    lastAnalyzedUrl = changeInfo.url;
+    analyzeAndAward(changeInfo.url, tabId);
+  } else if (changeInfo.status === "complete" && tab?.active && tab.url) {
+    if (tab.url !== lastAnalyzedUrl) {
+      lastAnalyzedUrl = tab.url;
+      analyzeAndAward(tab.url, tabId);
     }
+  }
 });
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
-    try {
-        const tab = await chrome.tabs.get(activeInfo.tabId);
-        if (tab?.url) {
-            lastAnalyzedUrl = tab.url;
-            const savedLevel = await loadRiskLevel();
-            setRiskLevel(savedLevel);
-        }
-    } catch {
-        setRiskLevel("safe");
+  try {
+    const tab = await chrome.tabs.get(activeInfo.tabId);
+    if (tab?.url) {
+      lastAnalyzedUrl = tab.url;
+      const savedLevel = await loadRiskLevel();
+      setRiskLevel(savedLevel);
     }
-});
-
-
-// --- Message handlers ---
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.type === "getRiskLevel") {
-        loadRiskLevel().then(level => sendResponse({ level }));
-        return true;
-    }
-
-    if (message.type === "getStats") {
-        loadStats().then(stats => sendResponse({ stats }));
-        return true;
-    }
-
-    if (message.type === "getDashboardData") {
-        loadStats().then(async (stats) => {
-            const riskLevel = await loadRiskLevel();
-            sendResponse({
-                stats,
-                riskLevel,
-                levelTitle: getLevelTitle(stats.level),
-                xpProgress: getXpToNextLevel(stats.xp, stats.level),
-            });
-        });
-        return true;
-    }
-
-    if (message.type === "pageScanResult") {
-        const { url, signals } = message;
-        const urlAnalysis = analyzeUrl(url);
-        const { level } = contentRiskFromSignals(signals, urlAnalysis);
-
-        if (level === "danger") {
-            setRiskLevel("danger");
-        } else if (level === "warning") {
-            setRiskLevel("warning");
-        }
-        sendResponse({ received: true });
-        return true;
-    }
-
-    if (message.type === "panicInitiated") {
-        updateStats(onPanicButtonClicked).then(updated => {
-            sendResponse({ stats: updated });
-        });
-        return true;
-    }
-
-    if (message.type === "recoveryCompleted") {
-        updateStats(onRecoveryCompleted).then(updated => {
-            notifyXpGain(updated, XP_REWARDS.PANIC_RECOVERY_COMPLETE, "Recovery steps completed!");
-            sendResponse({ stats: updated });
-        });
-        return true;
-    }
-
-    if (message.type === "dismissWarning") {
-        updateStats(async (stats) => {
-            let updated = await awardSafeBrowsingXp(stats);
-            await notifyXpGain(updated, XP_REWARDS.WARNING_IGNORED, "Continued with caution on a warning page");
-            return updated;
-        }).then(updated => {
-            sendResponse({ stats: updated });
-        });
-        return true;
-    }
-
-    return false;
-});
-
-
-// --- Extension install/update ---
-chrome.runtime.onInstalled.addListener(async () => {
-    const stats = await loadStats();
-    if (!stats.createdAt) {
-        await saveStats({
-            ...(await import("./lib/storage")).getDefaultStats(),
-            createdAt: Date.now(),
-            lastUpdated: Date.now(),
-        });
-    }
+  } catch {
     setRiskLevel("safe");
-    visitedUrls.clear();
+  }
+});
 
-    await showBrowserNotification(
-        "AI Hygiene Companion Activated",
-        "Stay safe online! We'll help you browse securely and earn XP.",
-    );
+// ---------------------------------------------------------------------------
+// Message handlers
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === "getRiskLevel") {
+    loadRiskLevel().then(level => sendResponse({ level }));
+    return true;
+  }
+  if (message.type === "getStats") {
+    loadStats().then(stats => sendResponse({ stats }));
+    return true;
+  }
+  if (message.type === "getDashboardData") {
+    loadStats().then(async (stats) => {
+      const riskLevel = await loadRiskLevel();
+      sendResponse({
+        stats,
+        riskLevel,
+        levelTitle: getLevelTitle(stats.level),
+        xpProgress: getXpToNextLevel(stats.xp, stats.level),
+      });
+    });
+    return true;
+  }
+  if (message.type === "pageScanResult") {
+    const { url, signals } = message;
+    const urlAnalysis = analyzeUrl(url);
+    const { level } = contentRiskFromSignals(signals, urlAnalysis);
+    if (level === "danger") setRiskLevel("danger");
+    else if (level === "warning") setRiskLevel("warning");
+    sendResponse({ received: true });
+    return true;
+  }
+  if (message.type === "panicInitiated") {
+    updateStats(onPanicButtonClicked).then(updated => sendResponse({ stats: updated }));
+    return true;
+  }
+  if (message.type === "recoveryCompleted") {
+    updateStats(onRecoveryCompleted).then(async (updated) => {
+      await notifyXpGain(updated, XP_REWARDS.PANIC_RECOVERY_COMPLETE, "Recovery steps completed!");
+      sendResponse({ stats: updated });
+    });
+    return true;
+  }
+  if (message.type === "dismissWarning") {
+    updateStats(async (stats) => {
+      const updated = await awardSafeBrowsingXp(stats);
+      await notifyXpGain(updated, XP_REWARDS.WARNING_IGNORED, "Continued with caution on a warning page");
+      return updated;
+    }).then(updated => sendResponse({ stats: updated }));
+    return true;
+  }
+  return false;
+});
+
+// ---------------------------------------------------------------------------
+// Install / update
+// ---------------------------------------------------------------------------
+chrome.runtime.onInstalled.addListener(async () => {
+  const stats = await loadStats();
+  if (!stats.createdAt) {
+    await saveStats({
+      ...(await import("./lib/storage")).getDefaultStats(),
+      createdAt: Date.now(),
+      lastUpdated: Date.now(),
+    });
+  }
+  setRiskLevel("safe");
+  await clearVisited();
+  await showBrowserNotification(
+    "AI Hygiene Companion Activated",
+    "Stay safe online! We'll help you browse securely and earn XP."
+  );
 });
