@@ -1,33 +1,35 @@
-// Popup.tsx — Fixed version
-// Key changes vs original:
-//   1. XPProgressBar now receives xpProgress.current / xpProgress.needed (not raw stats.xp / stats.maxXp)
-//   2. Handles "xpLoss" message type for danger-site penalty toasts
-//   3. levelTitle passed to XPProgressBar so it shows correctly on level up
+// src/popup/Popup.tsx — Phase 2A
+// Changes vs Phase 1:
+//   1. Handles "levelUp" message → shows distinct celebration toast(NOTOAST)
+//   2. xpToast and levelUpToast are separate state, don't overwrite each other
+//   3. XPProgressBar receives level-relative xpProgress values (unchanged from Phase 1 fix)
 
 import { useEffect, useState, useCallback } from "react";
 import { RiskStatus } from "./components/ui/RiskStatus";
 import { XPProgressBar } from "./components/XPBar";
-import { BadgeGrid, Badge } from "./components/Badges";
+import { BadgeGrid } from "./components/Badges";
 import { QuickTips } from "./components/QuickTips";
 import { PanicButton } from "./components/PanicButton";
 import type { UserStats } from "../lib/storage";
 import { getLevelTitle, getXpToNextLevel } from "../lib/gamification";
 
-interface XpGainEvent {
+interface XpToastData {
   xpAmount: number;
   reason: string;
-  totalXp: number;
+  isLoss: boolean;
+}
+
+interface LevelUpToastData {
   level: number;
   levelTitle: string;
-  xpProgress: { current: number; max: number };
-  isLoss?: boolean;
 }
 
 export default function Popup() {
   const [stats, setStats] = useState<UserStats | null>(null);
   const [riskLevel, setRiskLevel] = useState<"safe" | "warning" | "danger">("safe");
   const [recoveryOpen, setRecoveryOpen] = useState(false);
-  const [xpToast, setXpToast] = useState<(XpGainEvent & { isLoss?: boolean }) | null>(null);
+  const [xpToast, setXpToast] = useState<XpToastData | null>(null);
+  const [levelUpToast, setLevelUpToast] = useState<LevelUpToastData | null>(null);
   const [loading, setLoading] = useState(true);
 
   const loadData = useCallback(async () => {
@@ -47,37 +49,35 @@ export default function Popup() {
   useEffect(() => {
     loadData();
 
-    const messageListener = (message: { type: string; level?: string; [key: string]: unknown }) => {
+    const handleMessage = (message: Record<string, unknown>) => {
       if (message.type === "riskUpdate" && message.level) {
         setRiskLevel(message.level as "safe" | "warning" | "danger");
       }
       if (message.type === "xpGain") {
-        setXpToast({ ...(message as unknown as XpGainEvent), isLoss: false });
+        setXpToast({ xpAmount: message.xpAmount as number, reason: message.reason as string, isLoss: false });
         loadData();
         setTimeout(() => setXpToast(null), 3000);
       }
-      // FIXED: Handle XP loss (danger site penalty)
       if (message.type === "xpLoss") {
-        setXpToast({ ...(message as unknown as XpGainEvent), isLoss: true });
+        setXpToast({ xpAmount: message.xpAmount as number, reason: message.reason as string, isLoss: true });
         loadData();
-        setTimeout(() => setXpToast(null), 3000);
+        setTimeout(() => setXpToast(null), 3500);
       }
-      if (message.type === "stats") {
-        setStats(message.stats as UserStats);
+      // NEW: level-up celebration — separate from xp toast
+      if (message.type === "levelUp") {
+        setLevelUpToast({ level: message.level as number, levelTitle: message.levelTitle as string });
+        loadData();
+        setTimeout(() => setLevelUpToast(null), 4000);
       }
     };
 
-    chrome.runtime.onMessage.addListener(messageListener);
-    return () => chrome.runtime.onMessage.removeListener(messageListener);
+    chrome.runtime.onMessage.addListener(handleMessage);
+    return () => chrome.runtime.onMessage.removeListener(handleMessage);
   }, [loadData]);
 
   const handlePanic = async () => {
     setRecoveryOpen(true);
-    try {
-      await chrome.runtime.sendMessage({ type: "panicInitiated" });
-    } catch (e) {
-      console.error("Failed to notify panic:", e);
-    }
+    try { await chrome.runtime.sendMessage({ type: "panicInitiated" }); } catch { /* */ }
   };
 
   const handleRecoveryComplete = async () => {
@@ -85,9 +85,7 @@ export default function Popup() {
     try {
       await chrome.runtime.sendMessage({ type: "recoveryCompleted" });
       loadData();
-    } catch (e) {
-      console.error("Failed to notify recovery complete:", e);
-    }
+    } catch { /* */ }
   };
 
   if (loading || !stats) {
@@ -101,7 +99,6 @@ export default function Popup() {
     );
   }
 
-  // FIXED: Use xpProgressInLevel so bar resets to 0 on level up
   const xpProgress = getXpToNextLevel(stats.xp, stats.level);
   const levelTitle = getLevelTitle(stats.level);
 
@@ -120,18 +117,15 @@ export default function Popup() {
         </div>
       </div>
 
-      {/* Main Content */}
+      {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-4 bg-[#f8f9fa]">
         <RiskStatus />
-
-        {/* FIXED: pass xpProgress.current and xpProgress.needed, not raw stats */}
         <XPProgressBar
           currentXP={xpProgress.current}
           maxXP={xpProgress.needed}
           level={stats.level}
           levelTitle={levelTitle}
         />
-
         <BadgeGrid badges={stats.badges} />
         <QuickTips tips={stats.tips} />
         <div className="pt-2">
@@ -146,13 +140,11 @@ export default function Popup() {
         </button>
       </div>
 
-      {/* XP Toast — shows gain (green) or loss (red) */}
+      {/* XP gain / loss toast */}
       {xpToast && (
-        <div className={`absolute top-16 right-4 left-4 border-2 border-border p-3 animate-in slide-in-from-top-2 fade-in duration-200 z-50 ${
-          xpToast.isLoss
-            ? "bg-destructive text-white"
-            : "bg-foreground text-background"
-        }`}>
+        <div className={`absolute top-16 right-4 left-4 border-2 border-border p-3 z-40
+          animate-in slide-in-from-top-2 fade-in duration-200
+          ${xpToast.isLoss ? "bg-destructive text-white" : "bg-foreground text-background"}`}>
           <p className="text-xs font-bold">
             {xpToast.isLoss ? `-${xpToast.xpAmount} XP` : `+${xpToast.xpAmount} XP`}
           </p>
@@ -160,7 +152,23 @@ export default function Popup() {
         </div>
       )}
 
-      {/* Recovery Modal */}
+      {/* NEW: Level-up celebration toast — distinct styling, sits above xp toast */}
+      {levelUpToast && (
+        <div className="absolute top-4 right-4 left-4 border-4 border-border bg-background p-4 z-50
+          animate-in slide-in-from-top-4 fade-in duration-300">
+          <div className="flex items-center gap-3">
+            <div className="text-2xl">⬆</div>
+            <div>
+              <p className="text-sm font-bold font-['Syne']">Level Up!</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                You are now Level {levelUpToast.level} — {levelUpToast.levelTitle}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Recovery modal */}
       {recoveryOpen && (
         <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-background border-2 border-border rounded-lg p-4 m-4 max-h-[85%] overflow-y-auto">
@@ -199,8 +207,8 @@ export default function Popup() {
             <div className="mt-4 p-3 bg-muted border-2 border-border">
               <p className="text-xs font-bold mb-1">Remember:</p>
               <p className="text-xs text-muted-foreground">
-                Everyone makes mistakes online. The fact that you're going through these steps means
-                you're already practicing good digital hygiene. +30 XP for completing recovery!
+                Everyone makes mistakes online. Going through these steps means you're already
+                practising good digital hygiene. +30 XP for completing recovery!
               </p>
             </div>
             <button
