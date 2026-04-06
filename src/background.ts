@@ -178,18 +178,26 @@ function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
 // Core analysis + XP awards
 // ---------------------------------------------------------------------------
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
-  if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+    if (!url || !url.startsWith("http")) return;
+    if (visitedUrls.has(url)) return;
+    visitedUrls.add(url);
 
-  // If this tab was previously danger and is navigating away → award avoidance XP
-  if (tabId !== undefined) {
-    const prevDanger = await clearDangerTab(tabId);
-    if (prevDanger && prevDanger !== url) {
-      const before = await loadStats();
-      const after = await awardDangerAvoidedXp(before);
-      await saveStats(after);
-      await notifyXpGain(after, XP_REWARDS.DANGER_AVOIDED, "Navigated away from a dangerous site");
-      announceNewBadges(before, after);
-      if (after.level > before.level) notifyLevelUp(after.level);
+    // Run both analyses in parallel — ML is authoritative, heuristic is fallback
+    const [heuristicResult, mlResult] = await Promise.all([
+        Promise.resolve(analyzeUrl(url)),             // Heuristic (always available)
+        analyzeUrlWithBackend(url).catch(() => null), // Local API Backend
+    ]);
+
+    // Determine final risk level: ML wins if available
+    let finalLevel: "safe" | "warning" | "danger" = heuristicResult.level;
+    if (mlResult) {
+        // ML overrides heuristic if it detects danger, otherwise combine
+        if (mlResult.level === "danger") {
+            finalLevel = "danger";
+        } else if (mlResult.level === "warning" && finalLevel !== "danger") {
+            finalLevel = "warning";
+        }
+        console.info(`[AI Hygiene] ML risk: ${mlResult.level} (${mlResult.score.toFixed(3)}), Heuristic: ${heuristicResult.level} [Hardware: ${mlResult.provider}]`);
     }
   }
 
