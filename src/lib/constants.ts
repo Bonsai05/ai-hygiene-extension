@@ -8,6 +8,11 @@ export const EXTENSION_NAME = "AI Hygiene Companion";
 export const EXTENSION_VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+export const DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
+
+// ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
 export const STORAGE_KEYS = {
@@ -76,7 +81,7 @@ export const RISK_WEIGHTS = {
 // Context modifiers (for weighted scoring)
 // ---------------------------------------------------------------------------
 export const CONTEXT_MODIFIERS = {
-  KNOWN_BRAND: 1.5,    // Brand + suspicious = more likely phishing
+  KNOWN_BRAND: 0.5,    // Brand keywords REDUCE risk (legitimate sites)
   HAS_USER_INPUT: 1.3, // Forms increase stakes
   MULTIPLE_SIGNALS: 1.2, // 3+ signals = compound risk
 } as const;
@@ -207,6 +212,23 @@ export const TYPOSQUAT_PATTERNS = [
   /^app1e\./,       // app-one-e
   /^micros0ft\./,   // micros-zero-ft
   /^g00g1e\./,      // g-zero-zero-g-one-e
+] as const;
+
+// ---------------------------------------------------------------------------
+// Suspicious phrases (for page content scanning)
+// ---------------------------------------------------------------------------
+export const SUSPICIOUS_PHRASES = [
+  "verify your account",
+  "confirm your identity",
+  "update your information",
+  "suspend your account",
+  "unusual activity",
+  "verify your password",
+  "click here to verify",
+  "your account has been",
+  "confirm your account",
+  "security alert",
+  "urgent action required",
 ] as const;
 
 // ---------------------------------------------------------------------------

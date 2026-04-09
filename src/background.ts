@@ -1,11 +1,11 @@
-// src/background.ts — Phase 2A
-// Changes vs Phase 1:
-//   1. Level-up detection: sends "levelUp" message to popup when level increases
-//   2. onSecureLoginAttempt wired — called when content-script reports HTTPS + password field
-//   3. onPasswordFieldHttp wired — called when content-script reports HTTP + password field
-//   4. RiskEvent now persisted via saveRiskEvent after every analysis
-//   5. getNewlyEarnedBadges used to announce badges without duplicates
-//   6. All XP functions imported from gamification (no inline logic here)
+// src/background.ts — Phase 2C
+// Core analysis orchestration, XP awards, tab listeners
+// Key flows:
+//   1. Tab listeners trigger analysis on URL changes
+//   2. shouldAnalyzeUrl() filters based on skip list, domain cache, known-safe domains
+//   3. Triple analysis: heuristic + offscreen ML + backend ML (parallel)
+//   4. XP awarded for safe browsing via awardSafeBrowsingXp()
+//   5. Passive indicators (badge + icon) updated for at-a-glance status
 
 import {
   loadStats,
@@ -16,10 +16,9 @@ import {
   saveRiskEvent,
   type UserStats,
 } from "./lib/storage";
-import { analyzeUrl, contentRiskFromSignals } from "./lib/risk-detection";
+import { analyzeUrl, contentRiskFromSignals, type RiskLevel } from "./lib/risk-detection";
 import {
   awardSafeBrowsingXp,
-  awardDangerAvoidedXp,
   applyDangerPenalty,
   onPanicButtonClicked,
   onRecoveryCompleted,
@@ -29,8 +28,7 @@ import {
   getXpToNextLevel,
   getNewlyEarnedBadges,
 } from "./lib/gamification";
-import { canAwardXp } from "./lib/storage";
-import { XP_REWARDS } from "./lib/constants";
+import { XP_REWARDS, DEFAULT_BACKEND_URL } from "./lib/constants";
 import { showBrowserNotification } from "./lib/notifications";
 import {
   shouldAnalyzeUrl,
@@ -72,17 +70,6 @@ async function markTabAsDanger(tabId: number, url: string): Promise<void> {
   await chrome.storage.session.set({ [DANGER_TABS_KEY]: tabs });
 }
 
-async function clearDangerTab(tabId: number): Promise<string | null> {
-  const r = await chrome.storage.session.get([DANGER_TABS_KEY]);
-  const tabs: Record<number, string> = r[DANGER_TABS_KEY] ?? {};
-  const prev = tabs[tabId] ?? null;
-  if (prev) {
-    delete tabs[tabId];
-    await chrome.storage.session.set({ [DANGER_TABS_KEY]: tabs });
-  }
-  return prev;
-}
-
 // ---------------------------------------------------------------------------
 // Backend ML (Local FastAPI)
 // ---------------------------------------------------------------------------
@@ -94,7 +81,7 @@ interface BackendMLResult {
 
 async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | null> {
   try {
-    const res = await fetch("http://127.0.0.1:8000/analyze/url", {
+    const res = await fetch(`${DEFAULT_BACKEND_URL}/analyze/url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
@@ -146,11 +133,9 @@ async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult |
 // ---------------------------------------------------------------------------
 // Risk level state
 // ---------------------------------------------------------------------------
-let currentRiskLevel: "safe" | "warning" | "danger" = "safe";
 let lastAnalyzedUrl = "";
 
 function setRiskLevel(level: "safe" | "warning" | "danger") {
-  currentRiskLevel = level;
   saveRiskLevel(level);
   chrome.runtime.sendMessage({ type: "riskUpdate", level }).catch(() => {});
 }
@@ -266,16 +251,44 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (!url || !url.startsWith("http")) return;
 
   // Intelligent analysis: skip internal URLs, use domain caching, check whitelist
-  const shouldAnalyze = await shouldAnalyzeUrl(url);
-  if (!shouldAnalyze) {
-    // Check if we have a cached result to restore
-    const cached = getCachedAnalysis(url);
-    if (cached && tabId !== undefined) {
+  const decision = await shouldAnalyzeUrl(url);
+
+  // Handle cached result - restore risk level and award XP for safe browsing
+  if (!decision.shouldAnalyze) {
+    const cached = decision.cachedResult || getCachedAnalysis(url);
+    if (cached) {
+      // Restore risk level from cache
+      if (tabId !== undefined) {
+        updateBrowserActionBadge(tabId, cached.level);
+        updateToolbarIcon(tabId, cached.level);
+      }
       setRiskLevel(cached.level);
+
+      // Award XP for safe/warning cached pages (user is still browsing safely)
+      if (cached.level !== "danger") {
+        try {
+          const before = await loadStats();
+          const after = await awardSafeBrowsingXp(before);
+          await saveStats(after);
+          await saveRiskEvent({
+            url,
+            riskLevel: cached.level,
+            detectedPatterns: cached.patterns,
+            timestamp: Date.now(),
+            xpChange: XP_REWARDS.SAFE_BROWSE,
+          });
+          if (canAwardXp()) {
+            await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing (cached)");
+          }
+        } catch (e) {
+          console.error("[AI Hygiene] cached XP award error:", e);
+        }
+      }
     }
     return;
   }
 
+  // Skip if already visited in this session
   if (visitedUrls.has(url)) return;
   visitedUrls.add(url);
 
@@ -291,7 +304,7 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
 
   // Determine final risk level: ML wins if available (offscreen preferred, then backend)
   let finalLevel: "safe" | "warning" | "danger" = heuristic.level;
-  let mlResult = offscreenML || backendML;
+  const mlResult = offscreenML || backendML;
 
   if (mlResult) {
     if (mlResult.level === "danger") {
@@ -334,7 +347,7 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
       await saveStats(after);
       await saveRiskEvent({ url, riskLevel: "danger", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: -XP_REWARDS.DANGER_PENALTY });
 
-      // Rate limit XP loss notifications
+      // Rate limit XP loss NOTIFICATIONS (still apply the penalty)
       if (canAwardXp()) {
         await notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
       }
@@ -342,25 +355,18 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
       return;
     }
 
-    // Rate limit XP awards to prevent rapid-fire exploitation
+    // Always award XP for safe/warning pages
+    after = await awardSafeBrowsingXp(before);
+    await saveStats(after);
+    await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
+
+    // Rate limit XP gain NOTIFICATIONS (still award the XP)
     if (canAwardXp()) {
-      if (finalLevel === "warning") {
-        after = await awardSafeBrowsingXp(before);
-        await saveStats(after);
-        await saveRiskEvent({ url, riskLevel: "warning", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
-        if (after.safeBrowsingStreak > 1) {
-          await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
-        }
-      } else {
-        after = await awardSafeBrowsingXp(before);
-        await saveStats(after);
-        await saveRiskEvent({ url, riskLevel: "safe", detectedPatterns: [], timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
+      if (finalLevel === "warning" && after.safeBrowsingStreak > 1) {
+        await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
+      } else if (finalLevel === "safe") {
         await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
       }
-    } else {
-      // Still save the risk event, just skip XP award
-      after = before;
-      await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: 0 });
     }
 
     announceNewBadges(before, after);
@@ -449,7 +455,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       const domain = new URL(url).hostname;
       setDomainHasSensitiveForm(domain, signals.hasPasswordField || signals.hasLoginForm);
-    } catch {}
+    } catch {
+      // URL parsing failed, skip sensitive form tracking
+    }
 
     const urlAnalysis = analyzeUrl(url);
     const { level } = contentRiskFromSignals(signals, urlAnalysis);

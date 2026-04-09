@@ -1,8 +1,5 @@
-// src/popup/Popup.tsx — Phase 2A
-// Changes vs Phase 1:
-//   1. Handles "levelUp" message → shows distinct celebration toast(NOTOAST)
-//   2. xpToast and levelUpToast are separate state, don't overwrite each other
-//   3. XPProgressBar receives level-relative xpProgress values (unchanged from Phase 1 fix)
+// src/popup/Popup.tsx — Phase 2C
+// Main extension popup with dashboard, settings, and onboarding
 
 import { useEffect, useState, useCallback } from "react";
 import { RiskStatus } from "./components/ui/RiskStatus";
@@ -14,6 +11,7 @@ import { SettingsPage } from "./pages/Settings";
 import { OnboardingPage } from "./pages/Onboarding";
 import type { UserStats } from "../lib/storage";
 import { getLevelTitle, getXpToNextLevel } from "../lib/gamification";
+import { TIMINGS } from "../lib/constants";
 
 interface XpToastData {
   xpAmount: number;
@@ -28,7 +26,6 @@ interface LevelUpToastData {
 
 export default function Popup() {
   const [stats, setStats] = useState<UserStats | null>(null);
-  const [riskLevel, setRiskLevel] = useState<"safe" | "warning" | "danger">("safe");
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [xpToast, setXpToast] = useState<XpToastData | null>(null);
   const [levelUpToast, setLevelUpToast] = useState<LevelUpToastData | null>(null);
@@ -41,7 +38,6 @@ export default function Popup() {
       const response = await chrome.runtime.sendMessage({ type: "getDashboardData" });
       if (response) {
         setStats(response.stats);
-        setRiskLevel(response.riskLevel);
       }
     } catch (e) {
       console.error("Failed to load stats:", e);
@@ -61,24 +57,21 @@ export default function Popup() {
     });
 
     const handleMessage = (message: Record<string, unknown>) => {
-      if (message.type === "riskUpdate" && message.level) {
-        setRiskLevel(message.level as "safe" | "warning" | "danger");
-      }
       if (message.type === "xpGain") {
         setXpToast({ xpAmount: message.xpAmount as number, reason: message.reason as string, isLoss: false });
         loadData();
-        setTimeout(() => setXpToast(null), 3000);
+        setTimeout(() => setXpToast(null), TIMINGS.TOAST_DURATION_MS);
       }
       if (message.type === "xpLoss") {
         setXpToast({ xpAmount: message.xpAmount as number, reason: message.reason as string, isLoss: true });
         loadData();
-        setTimeout(() => setXpToast(null), 3500);
+        setTimeout(() => setXpToast(null), TIMINGS.TOAST_DURATION_MS + 500);
       }
       // NEW: level-up celebration — separate from xp toast
       if (message.type === "levelUp") {
         setLevelUpToast({ level: message.level as number, levelTitle: message.levelTitle as string });
         loadData();
-        setTimeout(() => setLevelUpToast(null), 4000);
+        setTimeout(() => setLevelUpToast(null), TIMINGS.LEVEL_UP_DURATION_MS);
       }
     };
 
@@ -88,7 +81,11 @@ export default function Popup() {
 
   const handlePanic = async () => {
     setRecoveryOpen(true);
-    try { await chrome.runtime.sendMessage({ type: "panicInitiated" }); } catch { /* */ }
+    try {
+      await chrome.runtime.sendMessage({ type: "panicInitiated" });
+    } catch (e) {
+      console.warn("Failed to initiate panic:", e);
+    }
   };
 
   const handleRecoveryComplete = async () => {
@@ -96,7 +93,9 @@ export default function Popup() {
     try {
       await chrome.runtime.sendMessage({ type: "recoveryCompleted" });
       loadData();
-    } catch { /* */ }
+    } catch (e) {
+      console.warn("Failed to complete recovery:", e);
+    }
   };
 
   if (loading || !stats) {
@@ -200,17 +199,17 @@ export default function Popup() {
               </div>
               <div>
                 <h2 className="text-base font-bold font-['Syne'] leading-tight">
-                  It's Okay — Let's Work Through This Together
+                  It&apos;s Okay — Let&apos;s Work Through This Together
                 </h2>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Follow these steps in order. You've got this.
+                  Follow these steps in order. You&apos;ve got this.
                 </p>
               </div>
             </div>
             <ol className="space-y-3 text-sm">
               {[
-                { title: "Stop and breathe.", detail: "Close the suspicious tab or email. Don't click anything else." },
-                { title: "Don't enter any information.", detail: "If you entered a password, change it from a trusted device immediately." },
+                { title: "Stop and breathe.", detail: "Close the suspicious tab or email. Don&apos;t click anything else." },
+                { title: "Don&apos;t enter any information.", detail: "If you entered a password, change it from a trusted device immediately." },
                 { title: "Run a malware scan.", detail: "Use Windows Security or your antivirus to scan for threats." },
                 { title: "Enable two-factor authentication.", detail: "On any account where you entered credentials, add 2FA now." },
                 { title: "Report the attempt.", detail: "Report phishing emails to your email provider and scam sites to Google Safe Browsing." },
@@ -229,7 +228,7 @@ export default function Popup() {
             <div className="mt-4 p-3 bg-muted border-2 border-border">
               <p className="text-xs font-bold mb-1">Remember:</p>
               <p className="text-xs text-muted-foreground">
-                Everyone makes mistakes online. Going through these steps means you're already
+                Everyone makes mistakes online. Going through these steps means you&apos;re already
                 practising good digital hygiene. +30 XP for completing recovery!
               </p>
             </div>
@@ -237,7 +236,7 @@ export default function Popup() {
               onClick={handleRecoveryComplete}
               className="mt-4 w-full bg-foreground text-background border-2 border-border px-4 py-3 text-sm font-bold font-['Syne'] hover:opacity-80 transition-opacity"
             >
-              I'm Ready to Continue Safely
+              I&apos;m Ready to Continue Safely
             </button>
           </div>
         </div>

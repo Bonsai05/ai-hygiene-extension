@@ -223,7 +223,7 @@ describe("contentRiskFromSignals", () => {
     };
     const result = contentRiskFromSignals(signals, baseUrlAnalysis);
     expect(result.level).toBe("safe");
-    expect(result.xpAwarded).toBe(5);
+    // Note: XP is awarded in background.ts, not in contentRiskFromSignals
   });
 });
 

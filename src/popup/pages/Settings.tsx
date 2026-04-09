@@ -1,7 +1,8 @@
 // src/popup/pages/Settings.tsx
 // Settings page with backend configuration, NPU toggle, and notification preferences
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { DEFAULT_BACKEND_URL } from "../../lib/constants";
 
 interface BackendSettings {
   enabled: boolean;
@@ -27,7 +28,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [backend, setBackend] = useState<BackendSettings>({
     enabled: true,
     useLocalBackend: false,
-    backendUrl: "http://127.0.0.1:8000",
+    backendUrl: DEFAULT_BACKEND_URL,
     useAmdNpu: false,
     autoStartBackend: true,
     mlModelLazyLoad: true,
@@ -43,22 +44,17 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [backendStatus, setBackendStatus] = useState<"unknown" | "running" | "offline">("unknown");
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
-    checkBackendStatus();
-  }, []);
-
-  async function loadSettings() {
+  const loadSettings = useCallback(async () => {
     try {
       const result = await chrome.runtime.sendMessage({ type: "getSettings" });
       if (result?.backend) setBackend(result.backend);
       if (result?.notifications) setNotifications(result.notifications);
-    } catch {
-      // Use defaults
+    } catch (e) {
+      console.warn("Failed to load settings:", e);
     }
-  }
+  }, []);
 
-  async function checkBackendStatus() {
+  const checkBackendStatus = useCallback(async () => {
     try {
       const res = await fetch(`${backend.backendUrl}/health`, {
         method: "GET",
@@ -68,7 +64,12 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     } catch {
       setBackendStatus("offline");
     }
-  }
+  }, [backend.backendUrl]);
+
+  useEffect(() => {
+    loadSettings();
+    checkBackendStatus();
+  }, [loadSettings, checkBackendStatus]);
 
   async function handleTestConnection() {
     try {
@@ -77,8 +78,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         signal: AbortSignal.timeout(3000),
       });
       alert(res.ok ? "✅ Connection successful!" : "❌ Backend responded with error");
-    } catch {
-      alert("❌ Cannot connect to backend. Ensure it's running on " + backend.backendUrl);
+    } catch (e) {
+      alert(`❌ Cannot connect to backend. Ensure it's running on ${backend.backendUrl}. Error: ${e}`);
     }
   }
 
@@ -185,6 +186,13 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         {/* Backend Configuration */}
         <Section title="Backend Configuration">
           <div className="space-y-3">
+            <ToggleRow
+              label="Use Local Backend"
+              description="Connect to local ML backend for enhanced detection"
+              checked={backend.useLocalBackend}
+              onChange={(v) => setBackend((s) => ({ ...s, useLocalBackend: v }))}
+            />
+
             <div>
               <label className="text-sm font-medium text-foreground">Backend URL</label>
               <input
@@ -192,7 +200,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 value={backend.backendUrl}
                 onChange={(e) => setBackend((s) => ({ ...s, backendUrl: e.target.value }))}
                 className="mt-1 w-full px-3 py-2 border border-input bg-background rounded-md text-sm"
-                placeholder="http://127.0.0.1:8000"
+                placeholder={DEFAULT_BACKEND_URL}
               />
             </div>
 

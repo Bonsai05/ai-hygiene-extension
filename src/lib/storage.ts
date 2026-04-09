@@ -4,7 +4,7 @@
 //   2. Error handling for Chrome storage (quota exceeded, corrupted data)
 //   3. Constants imported from constants.ts
 
-import { STORAGE_KEYS, DEFAULT_BADGES, XP_PER_LEVEL, MAX_LEVEL, LEVEL_THRESHOLDS } from "./constants";
+import { STORAGE_KEYS, MAX_LEVEL, LEVEL_THRESHOLDS } from "./constants";
 
 export type BadgeTier = "bronze" | "silver" | "gold";
 export type BadgeCategory = "streak" | "threat" | "recovery" | "habit";
@@ -256,12 +256,10 @@ export function saveRiskLevel(level: "safe" | "warning" | "danger"): Promise<voi
 }
 
 // --- Risk event log (last 50, newest first) ---
-const RISK_LOG_KEY = "riskEventLog";
-
 export async function loadRiskEvents(): Promise<RiskEvent[]> {
   return new Promise((resolve) => {
-    chrome.storage.local.get([RISK_LOG_KEY], (result) => {
-      resolve(result[RISK_LOG_KEY] ?? []);
+    chrome.storage.local.get([STORAGE_KEYS.RISK_EVENTS], (result) => {
+      resolve(result[STORAGE_KEYS.RISK_EVENTS] ?? []);
     });
   });
 }
@@ -270,6 +268,6 @@ export async function saveRiskEvent(event: RiskEvent): Promise<void> {
   const existing = await loadRiskEvents();
   const updated = [event, ...existing].slice(0, 50);
   return new Promise((resolve) => {
-    chrome.storage.local.set({ [RISK_LOG_KEY]: updated }, resolve);
+    chrome.storage.local.set({ [STORAGE_KEYS.RISK_EVENTS]: updated }, resolve);
   });
 }
