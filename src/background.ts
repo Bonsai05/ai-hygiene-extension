@@ -38,6 +38,9 @@ import { showBrowserNotification } from "./lib/notifications";
 const VISITED_KEY = "visitedUrls";
 const DANGER_TABS_KEY = "dangerTabs";
 
+// In-memory visited URLs cache (supplements session storage)
+const visitedUrls = new Set<string>();
+
 async function wasRecentlyVisited(url: string): Promise<boolean> {
   const r = await chrome.storage.session.get([VISITED_KEY]);
   return (r[VISITED_KEY] ?? []).includes(url);
@@ -74,7 +77,7 @@ async function clearDangerTab(tabId: number): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Backend ML
+// Backend ML (Local FastAPI)
 // ---------------------------------------------------------------------------
 interface BackendMLResult {
   level: "safe" | "warning" | "danger";
@@ -96,6 +99,39 @@ async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | nul
       score >= 0.7 ? "danger" : score >= 0.3 ? "warning" : "safe";
     return { level, score, provider: data.provider ?? "Local FastAPI" };
   } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Offscreen ML (Transformers.js WASM)
+// ---------------------------------------------------------------------------
+async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult | null> {
+  try {
+    // Ensure offscreen document exists
+    const hasOffscreen = await chrome.offscreen.hasDocument();
+    if (!hasOffscreen) {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['WORKERS'],
+        justification: 'ML inference with Transformers.js',
+      });
+    }
+
+    const result = await chrome.runtime.sendMessage({
+      type: 'analyzeUrl',
+      url,
+    });
+
+    if (!result) return null;
+
+    return {
+      level: result.level,
+      score: result.score,
+      provider: result.modelVersion ?? 'Transformers.js (WASM)',
+    };
+  } catch (err) {
+    console.warn('[AI Hygiene] Offscreen ML failed:', err);
     return null;
   }
 }
@@ -178,50 +214,42 @@ function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
 // Core analysis + XP awards
 // ---------------------------------------------------------------------------
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
-    if (!url || !url.startsWith("http")) return;
-    if (visitedUrls.has(url)) return;
-    visitedUrls.add(url);
-
-    // Run both analyses in parallel — ML is authoritative, heuristic is fallback
-    const [heuristicResult, mlResult] = await Promise.all([
-        Promise.resolve(analyzeUrl(url)),             // Heuristic (always available)
-        analyzeUrlWithBackend(url).catch(() => null), // Local API Backend
-    ]);
-
-    // Determine final risk level: ML wins if available
-    let finalLevel: "safe" | "warning" | "danger" = heuristicResult.level;
-    if (mlResult) {
-        // ML overrides heuristic if it detects danger, otherwise combine
-        if (mlResult.level === "danger") {
-            finalLevel = "danger";
-        } else if (mlResult.level === "warning" && finalLevel !== "danger") {
-            finalLevel = "warning";
-        }
-        console.info(`[AI Hygiene] ML risk: ${mlResult.level} (${mlResult.score.toFixed(3)}), Heuristic: ${heuristicResult.level} [Hardware: ${mlResult.provider}]`);
-    }
-  }
+  if (!url || !url.startsWith("http")) return;
+  if (visitedUrls.has(url)) return;
+  visitedUrls.add(url);
 
   if (await wasRecentlyVisited(url)) return;
   await markVisited(url);
 
-  const [heuristic, ml] = await Promise.all([
+  // Run all analyses in parallel — offscreen ML (WASM), backend ML (FastAPI), and heuristics
+  const [heuristic, offscreenML, backendML] = await Promise.all([
     Promise.resolve(analyzeUrl(url)),
-    analyzeUrlWithBackend(url).catch(() => null),
+    analyzeUrlWithOffscreenML().catch(() => null),  // On-device ML (WASM)
+    analyzeUrlWithBackend(url).catch(() => null),   // Optional FastAPI backend
   ]);
 
+  // Determine final risk level: ML wins if available (offscreen preferred, then backend)
   let finalLevel: "safe" | "warning" | "danger" = heuristic.level;
-  if (ml) {
-    if (ml.level === "danger") finalLevel = "danger";
-    else if (ml.level === "warning" && finalLevel !== "danger") finalLevel = "warning";
-    console.info(`[AI Hygiene] ML:${ml.level}(${ml.score.toFixed(3)}) Heuristic:${heuristic.level} [${ml.provider}]`);
+  let mlResult = offscreenML || backendML;
+
+  if (mlResult) {
+    if (mlResult.level === "danger") {
+      finalLevel = "danger";
+    } else if (mlResult.level === "warning" && finalLevel !== "danger") {
+      finalLevel = "warning";
+    }
+    console.info(`[AI Hygiene] ML:${mlResult.level}(${mlResult.score.toFixed(3)}) Heuristic:${heuristic.level} [${mlResult.provider}]`);
   }
 
+  // Notify popup of ML result
   chrome.runtime.sendMessage({
-    type: "mlRiskResult", level: finalLevel,
-    mlScore: ml?.score ?? null,
-    modelVersion: ml?.provider ?? "Local CPU/Heuristic",
+    type: "mlRiskResult",
+    level: finalLevel,
+    mlScore: mlResult?.score ?? null,
+    modelVersion: mlResult?.provider ?? "Local CPU/Heuristic",
   }).catch(() => {});
 
+  // Inject warning banner if needed
   if (tabId !== undefined && (finalLevel === "danger" || finalLevel === "warning")) {
     injectWarningBanner(tabId, finalLevel);
   }
@@ -369,8 +397,75 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     });
     return true;
   }
+
+  // Settings handlers
+  if (message.type === "getSettings") {
+    chrome.storage.local.get(["backendSettings", "notificationSettings"]).then((result) => {
+      sendResponse({
+        backend: result.backendSettings ?? getDefaultBackendSettings(),
+        notifications: result.notificationSettings ?? getDefaultNotificationSettings(),
+      });
+    });
+    return true;
+  }
+
+  if (message.type === "saveSettings") {
+    chrome.storage.local
+      .set({
+        backendSettings: message.backend,
+        notificationSettings: message.notifications,
+      })
+      .then(() => sendResponse({ success: true }));
+    return true;
+  }
+
+  if (message.type === "startBackend") {
+    // Backend auto-start would be handled by native messaging or a separate script
+    // For now, just acknowledge the request
+    sendResponse({ success: true, note: "Backend should be started manually" });
+    return true;
+  }
+
   return false;
 });
+
+// Default settings helpers
+function getDefaultBackendSettings(): BackendSettings {
+  return {
+    enabled: true,
+    useLocalBackend: false,
+    backendUrl: "http://127.0.0.1:8000",
+    useAmdNpu: false,
+    autoStartBackend: true,
+    mlModelLazyLoad: true,
+  };
+}
+
+function getDefaultNotificationSettings(): NotificationSettings {
+  return {
+    xpGainEnabled: true,
+    badgeEarnedEnabled: true,
+    levelUpEnabled: true,
+    dangerAlertEnabled: true,
+  };
+}
+
+// Types for settings (shared with Settings.tsx)
+interface BackendSettings {
+  enabled: boolean;
+  useLocalBackend: boolean;
+  backendUrl: string;
+  useAmdNpu: boolean;
+  autoStartBackend: boolean;
+  mlModelLazyLoad: boolean;
+}
+
+interface NotificationSettings {
+  xpGainEnabled: boolean;
+  badgeEarnedEnabled: boolean;
+  levelUpEnabled: boolean;
+  dangerAlertEnabled: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Install
