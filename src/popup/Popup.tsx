@@ -10,6 +10,8 @@ import { XPProgressBar } from "./components/XPBar";
 import { BadgeGrid } from "./components/Badges";
 import { QuickTips } from "./components/QuickTips";
 import { PanicButton } from "./components/PanicButton";
+import { SettingsPage } from "./pages/Settings";
+import { OnboardingPage } from "./pages/Onboarding";
 import type { UserStats } from "../lib/storage";
 import { getLevelTitle, getXpToNextLevel } from "../lib/gamification";
 
@@ -31,6 +33,8 @@ export default function Popup() {
   const [xpToast, setXpToast] = useState<XpToastData | null>(null);
   const [levelUpToast, setLevelUpToast] = useState<LevelUpToastData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -48,6 +52,13 @@ export default function Popup() {
 
   useEffect(() => {
     loadData();
+
+    // Check if onboarding needs to be shown
+    chrome.storage.local.get(["onboardingCompleted"]).then((result) => {
+      if (!result.onboardingCompleted) {
+        setShowOnboarding(true);
+      }
+    });
 
     const handleMessage = (message: Record<string, unknown>) => {
       if (message.type === "riskUpdate" && message.level) {
@@ -99,6 +110,14 @@ export default function Popup() {
     );
   }
 
+  if (showOnboarding) {
+    return <OnboardingPage onComplete={() => setShowOnboarding(false)} />;
+  }
+
+  if (showSettings) {
+    return <SettingsPage onBack={() => setShowSettings(false)} />;
+  }
+
   const xpProgress = getXpToNextLevel(stats.xp, stats.level);
   const levelTitle = getLevelTitle(stats.level);
 
@@ -112,9 +131,12 @@ export default function Popup() {
             Level {stats.level} — {levelTitle}
           </p>
         </div>
-        <div className="size-8 border-2 border-border flex items-center justify-center text-muted-foreground cursor-pointer hover:bg-accent transition-colors">
+        <button
+          onClick={() => setShowSettings(true)}
+          className="size-8 border-2 border-border flex items-center justify-center text-muted-foreground cursor-pointer hover:bg-accent transition-colors"
+        >
           ⚙
-        </div>
+        </button>
       </div>
 
       {/* Scrollable content */}
