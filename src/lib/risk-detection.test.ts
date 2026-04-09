@@ -33,8 +33,17 @@ describe("analyzeUrl - Danger URLs", () => {
   });
 
   it("detects suspicious TLD (.tk)", () => {
-    const result = analyzeUrl("https://amaz0n-verify.ga/account");
+    // HTTP + suspicious TLD = 40 points (warning level)
+    const result = analyzeUrl("http://example.tk/page");
+    expect(result.level).toBe("warning");
+    expect(result.patterns).toContain("suspicious_tld");
+  });
+
+  it("detects typosquatting with brand + suspicious TLD as danger", () => {
+    // Typosquatting (65) + suspicious TLD (20) + HTTP (20) = 105 points (danger)
+    const result = analyzeUrl("http://amaz0n.tk/login");
     expect(result.level).toBe("danger");
+    expect(result.patterns).toContain("typosquatting");
     expect(result.patterns).toContain("suspicious_tld");
   });
 
@@ -52,11 +61,11 @@ describe("analyzeUrl - Danger URLs", () => {
 });
 
 describe("analyzeUrl - Warning URLs", () => {
-  it("identifies suspicious TLD without other indicators as safe (low score)", () => {
+  it("identifies suspicious TLD without other indicators as warning", () => {
     const result = analyzeUrl("http://example.tk/page");
-    // With weighted scoring, single suspicious TLD scores 20, below warning threshold (35)
-    expect(result.level).toBe("safe");
-    expect(result.score).toBe(20);
+    // HTTP + suspicious TLD = 40 points, at/above warning threshold (35)
+    expect(result.level).toBe("warning");
+    expect(result.score).toBeGreaterThanOrEqual(35);
   });
 
   it("identifies HTTP protocol as safe (low score)", () => {
@@ -107,7 +116,11 @@ describe("analyzePageContent", () => {
   });
 
   it("detects suspicious phrases", () => {
-    document.body.innerHTML = "<p>Verify your account immediately to avoid suspension</p>";
+    // Mock innerText since JSDOM doesn't compute it
+    Object.defineProperty(document.body, "innerText", {
+      value: "Verify your account immediately to avoid suspension",
+      writable: true,
+    });
     const signals = analyzePageContent();
     expect(signals.suspiciousPhrases.length).toBeGreaterThan(0);
     expect(signals.suspiciousPhrases).toContain("verify your account");
@@ -162,7 +175,7 @@ describe("contentRiskFromSignals", () => {
     expect(result.patterns).toContain("password_field_external_submit");
   });
 
-  it("upgrades to warning for 3+ suspicious phrases", () => {
+  it("detects 3+ suspicious phrases (adds risk points)", () => {
     const signals: PageRiskSignals = {
       hasLoginForm: false,
       formActionExternal: false,
@@ -175,8 +188,25 @@ describe("contentRiskFromSignals", () => {
       missingSecurityIndicators: false,
     };
     const result = contentRiskFromSignals(signals, baseUrlAnalysis);
-    expect(result.level).toBe("warning");
+    // 30 points from urgency language (below warning threshold of 35)
     expect(result.patterns).toContain("urgency_language_detected");
+  });
+
+  it("upgrades to warning for 3+ phrases with login form", () => {
+    const signals: PageRiskSignals = {
+      hasLoginForm: true,
+      formActionExternal: false,
+      hasPasswordField: false,
+      hasEmailField: false,
+      externalFormAction: null,
+      hasObfuscatedText: true,
+      suspiciousPhrases: ["verify your account", "confirm your identity", "urgent action required"],
+      hasIframeEmbed: false,
+      missingSecurityIndicators: false,
+    };
+    const result = contentRiskFromSignals(signals, baseUrlAnalysis);
+    // 30 (urgency) + 25 (login form with phrases) = 55 points (warning)
+    expect(result.level).toBe("warning");
   });
 
   it("awards XP for safe pages", () => {

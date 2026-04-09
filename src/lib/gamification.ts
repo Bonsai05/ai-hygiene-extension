@@ -1,10 +1,8 @@
-// src/lib/gamification.ts — Phase 2A
-// Changes vs Phase 1:
-//   1. All 12 badge unlock conditions implemented
-//   2. onSecureLoginAttempt now actually called from background (was dead code)
-//   3. onPasswordFieldHttp is a new soft-warning trigger (no XP loss, just a flag)
-//   4. checkLevelUpBadge checks for hygiene-master at Level 5
-//   5. getNewlyEarnedBadges helper for popup to detect level-up badge grants
+// src/lib/gamification.ts — Phase 2B
+// Changes vs Phase 2A:
+//   1. Uses constants from constants.ts (single source of truth)
+//   2. Rate limiting for XP awards (prevents rapid-fire tab switch exploitation)
+//   3. Uses mutex-protected updateStats for all operations
 
 import {
   type UserStats,
@@ -12,20 +10,9 @@ import {
   removeXp,
   awardBadge,
   xpProgressInLevel,
+  canAwardXp,
 } from "./storage";
-
-// --- XP reward table (single source of truth) ---
-export const XP_REWARDS = {
-  SAFE_BROWSE: 5,
-  WARNING_IGNORED: 10,
-  DANGER_AVOIDED: 25,
-  DANGER_PENALTY: 15,
-  SECURE_LOGIN: 10,
-  PANIC_RECOVERY_COMPLETE: 30,
-  PANIC_INITIATED: 5,
-  BADGE_EARNED: 50,
-  STREAK_MILESTONE: 15,
-} as const;
+import { XP_REWARDS, STREAK_MILESTONES, LEVEL_TITLES } from "./constants";
 
 // Streak milestones: pages → badge id
 const STREAK_MILESTONES: Record<number, string> = {
@@ -194,19 +181,7 @@ export function getNewlyEarnedBadges(before: UserStats, after: UserStats) {
 
 // --- Level helpers ---
 export function getLevelTitle(level: number): string {
-  const titles: Record<number, string> = {
-    1: "Newcomer",
-    2: "Browser",
-    3: "Surfer",
-    4: "Defender",
-    5: "Guardian",
-    6: "Sentinel",
-    7: "Shield Master",
-    8: "Security Expert",
-    9: "Cyber Guardian",
-    10: "Digital Hygiene Hero",
-  };
-  return titles[level] ?? `Level ${level}`;
+  return LEVEL_TITLES[level] ?? `Level ${level}`;
 }
 
 export function getXpToNextLevel(xp: number, level: number): { current: number; needed: number } {

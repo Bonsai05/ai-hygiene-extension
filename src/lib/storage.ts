@@ -1,10 +1,10 @@
-// src/lib/storage.ts — Phase 2A
-// Changes vs Phase 1:
-//   1. BadgeTier ("bronze"|"silver"|"gold") and BadgeCategory ("streak"|"threat"|"recovery"|"habit") added
-//   2. Full 12-badge catalog replacing the old 8
-//   3. secureLoginsDetected added to UserStats
-//   4. RiskEvent.xpChange replaces xpAwarded, and log is now actually persisted
-//   5. loadStats() merges new badges into existing installs without wiping earned state
+// src/lib/storage.ts — Phase 2B
+// Changes vs Phase 2A:
+//   1. Mutex queue for concurrent XP/badge updates (prevents race conditions)
+//   2. Error handling for Chrome storage (quota exceeded, corrupted data)
+//   3. Constants imported from constants.ts
+
+import { STORAGE_KEYS, DEFAULT_BADGES, XP_PER_LEVEL, MAX_LEVEL, LEVEL_THRESHOLDS } from "./constants";
 
 export type BadgeTier = "bronze" | "silver" | "gold";
 export type BadgeCategory = "streak" | "threat" | "recovery" | "habit";
@@ -52,25 +52,25 @@ export interface RiskEvent {
 }
 
 // --- XP thresholds (total XP to reach that level) ---
-const XP_PER_LEVEL = [0, 100, 300, 600, 1000, 1500, 2100, 2800, 3600, 4500];
+// Using constants from constants.ts for single source of truth
 
 export function xpForLevel(level: number): number {
   if (level <= 1) return 0;
-  if (level >= XP_PER_LEVEL.length) return XP_PER_LEVEL[XP_PER_LEVEL.length - 1];
-  return XP_PER_LEVEL[level - 1];
+  if (level >= LEVEL_THRESHOLDS.length) return LEVEL_THRESHOLDS[LEVEL_THRESHOLDS.length - 1];
+  return LEVEL_THRESHOLDS[level - 1];
 }
 
 export function maxXpForLevel(level: number): number {
-  if (level >= XP_PER_LEVEL.length) return XP_PER_LEVEL[XP_PER_LEVEL.length - 1];
-  return XP_PER_LEVEL[level];
+  if (level >= LEVEL_THRESHOLDS.length) return LEVEL_THRESHOLDS[LEVEL_THRESHOLDS.length - 1];
+  return LEVEL_THRESHOLDS[level];
 }
 
 export function levelFromXp(xp: number): number {
   let level = 1;
-  for (let i = XP_PER_LEVEL.length - 1; i >= 0; i--) {
-    if (xp >= XP_PER_LEVEL[i]) { level = i + 1; break; }
+  for (let i = LEVEL_THRESHOLDS.length - 1; i >= 0; i--) {
+    if (xp >= LEVEL_THRESHOLDS[i]) { level = i + 1; break; }
   }
-  return Math.min(level, XP_PER_LEVEL.length - 1);
+  return Math.min(level, MAX_LEVEL);
 }
 
 /** XP progress within the current level — resets to 0 on level up. Use this for the bar. */
@@ -153,12 +153,60 @@ export function getDefaultStats(): UserStats {
   return { ...DEFAULT_STATS, badges: ALL_BADGES.map(b => ({ ...b })) };
 }
 
-// --- Storage access ---
+// ---------------------------------------------------------------------------
+// Mutex queue for concurrent updates (prevents race conditions)
+// ---------------------------------------------------------------------------
+let statsLock = Promise.resolve();
+let lastXpAwardTime = 0;
+
+/**
+ * Update stats with mutex protection - prevents race conditions when multiple
+ * XP awards happen simultaneously (e.g., safe browsing + streak milestone)
+ */
+export async function updateStats(
+  updater: (stats: UserStats) => UserStats | Promise<UserStats>
+): Promise<UserStats> {
+  statsLock = statsLock.then(async () => {
+    const current = await loadStats();
+    const updated = await updater(current);
+    await saveStats(updated);
+    return updated;
+  });
+  return statsLock;
+}
+
+/**
+ * Check if XP can be awarded (rate limiting to prevent rapid-fire awards)
+ */
+export function canAwardXp(): boolean {
+  const now = Date.now();
+  if (now - lastXpAwardTime < 5000) return false; // 5 second cooldown
+  lastXpAwardTime = now;
+  return true;
+}
+
+/**
+ * Reset XP cooldown (for testing)
+ */
+export function resetXpCooldown(): void {
+  lastXpAwardTime = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Storage access with error handling
+// ---------------------------------------------------------------------------
 export function loadStats(): Promise<UserStats> {
   return new Promise((resolve) => {
-    chrome.storage.local.get(["userStats"], (result) => {
-      if (result.userStats) {
-        const raw = result.userStats;
+    chrome.storage.local.get([STORAGE_KEYS.USER_STATS], (result) => {
+      // Error handling for storage issues
+      if (chrome.runtime.lastError) {
+        console.error("[Storage] Load failed:", chrome.runtime.lastError);
+        resolve(getDefaultStats()); // Fallback to defaults
+        return;
+      }
+
+      if (result[STORAGE_KEYS.USER_STATS]) {
+        const raw = result[STORAGE_KEYS.USER_STATS];
         const merged: UserStats = { ...getDefaultStats(), ...raw };
         // Always recompute maxXp from level (fixes stale 100s)
         merged.maxXp = maxXpForLevel(merged.level);
@@ -180,18 +228,17 @@ export function loadStats(): Promise<UserStats> {
 }
 
 export function saveStats(stats: UserStats): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ userStats: stats }, resolve);
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set({ [STORAGE_KEYS.USER_STATS]: stats }, () => {
+      // Error handling for storage quota exceeded, etc.
+      if (chrome.runtime.lastError) {
+        console.error("[Storage] Save failed:", chrome.runtime.lastError);
+        reject(chrome.runtime.lastError);
+        return;
+      }
+      resolve();
+    });
   });
-}
-
-export async function updateStats(
-  updater: (stats: UserStats) => UserStats | Promise<UserStats>
-): Promise<UserStats> {
-  const current = await loadStats();
-  const updated = await updater(current);
-  await saveStats(updated);
-  return updated;
 }
 
 export function loadRiskLevel(): Promise<"safe" | "warning" | "danger"> {

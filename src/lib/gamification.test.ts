@@ -11,8 +11,8 @@ import {
   getNewlyEarnedBadges,
   getLevelTitle,
   getXpToNextLevel,
-  XP_REWARDS,
 } from "./gamification";
+import { XP_REWARDS } from "./constants";
 import type { UserStats } from "./storage";
 
 function createDefaultStats(): UserStats {
@@ -56,12 +56,14 @@ describe("XP Rewards", () => {
 });
 
 describe("awardSafeBrowsingXp", () => {
-  it("awards 5 XP for safe browsing", async () => {
+  it("awards 5 XP for safe browsing (plus safe-surfer badge bonus)", async () => {
     const stats = createDefaultStats();
     const result = await awardSafeBrowsingXp(stats);
-    expect(result.xp).toBe(5);
+    expect(result.xp).toBe(5 + XP_REWARDS.BADGE_EARNED); // 5 + 50 for safe-surfer
     expect(result.safeBrowsingStreak).toBe(1);
     expect(result.totalPagesAnalyzed).toBe(1);
+    const safeSurfer = result.badges.find((b) => b.id === "safe-surfer");
+    expect(safeSurfer?.earned).toBe(true);
   });
 
   it("awards safe-surfer badge on first safe page", async () => {
@@ -74,7 +76,9 @@ describe("awardSafeBrowsingXp", () => {
 
   it("awards streak-starter badge at 10 pages", async () => {
     let stats = createDefaultStats();
-    for (let i = 0; i < 10; i++) {
+    // First call awards safe-surfer, so we need 9 more to reach streak 10
+    stats = await awardSafeBrowsingXp(stats); // streak = 1, safe-surfer earned
+    for (let i = 1; i < 10; i++) {
       stats = await awardSafeBrowsingXp(stats);
     }
     expect(stats.safeBrowsingStreak).toBe(10);
@@ -94,24 +98,26 @@ describe("awardSafeBrowsingXp", () => {
 describe("applyDangerPenalty", () => {
   it("removes 15 XP and resets streak", async () => {
     let stats = createDefaultStats();
-    stats = await awardSafeBrowsingXp(stats); // +5 XP, streak = 1
+    stats = await awardSafeBrowsingXp(stats); // +5 XP + 50 badge bonus, streak = 1
     stats = await awardSafeBrowsingXp(stats); // +5 XP, streak = 2
-    expect(stats.xp).toBe(10);
+    expect(stats.xp).toBe(60); // 5 + 50 + 5
     expect(stats.safeBrowsingStreak).toBe(2);
 
     const result = await applyDangerPenalty(stats);
-    expect(result.xp).toBe(-5); // 10 - 15
+    expect(result.xp).toBe(45); // 60 - 15
     expect(result.safeBrowsingStreak).toBe(0);
     expect(result.dangerSitesClicked).toBe(1);
   });
 });
 
 describe("awardDangerAvoidedXp", () => {
-  it("awards 25 XP for avoiding danger", async () => {
+  it("awards 25 XP for avoiding danger (plus phish-spotter badge bonus)", async () => {
     const stats = createDefaultStats();
     const result = await awardDangerAvoidedXp(stats);
-    expect(result.xp).toBe(25);
+    expect(result.xp).toBe(25 + XP_REWARDS.BADGE_EARNED); // 25 + 50
     expect(result.phishingAttemptsAvoided).toBe(1);
+    const phishSpotter = result.badges.find((b) => b.id === "phish-spotter");
+    expect(phishSpotter?.earned).toBe(true);
   });
 
   it("awards phish-spotter badge on first avoidance", async () => {
@@ -154,11 +160,13 @@ describe("onPanicButtonClicked and onRecoveryCompleted", () => {
 });
 
 describe("onSecureLoginAttempt", () => {
-  it("awards 10 XP for secure login", async () => {
+  it("awards 10 XP for secure login (plus secure-login badge bonus)", async () => {
     const stats = createDefaultStats();
     const result = await onSecureLoginAttempt(stats);
-    expect(result.xp).toBe(10);
+    expect(result.xp).toBe(10 + XP_REWARDS.BADGE_EARNED); // 10 + 50
     expect(result.secureLoginsDetected).toBe(1);
+    const secureLogin = result.badges.find((b) => b.id === "secure-login");
+    expect(secureLogin?.earned).toBe(true);
   });
 
   it("awards secure-login badge on first secure login", async () => {
@@ -170,10 +178,10 @@ describe("onSecureLoginAttempt", () => {
 });
 
 describe("onPasswordFieldHttp", () => {
-  it("awards password-pro badge without XP loss", async () => {
+  it("awards password-pro badge with badge XP bonus", async () => {
     const stats = createDefaultStats();
     const result = await onPasswordFieldHttp(stats);
-    expect(result.xp).toBe(0); // No XP loss, just badge
+    expect(result.xp).toBe(XP_REWARDS.BADGE_EARNED); // 50 XP for badge
     const passwordPro = result.badges.find((b) => b.id === "password-pro");
     expect(passwordPro?.earned).toBe(true);
   });
