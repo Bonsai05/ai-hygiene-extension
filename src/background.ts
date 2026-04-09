@@ -31,6 +31,12 @@ import {
   XP_REWARDS,
 } from "./lib/gamification";
 import { showBrowserNotification } from "./lib/notifications";
+import {
+  shouldAnalyzeUrl,
+  markDomainAnalyzed,
+  setDomainHasSensitiveForm,
+  getCachedAnalysis,
+} from "./lib/analysis-strategy";
 
 // ---------------------------------------------------------------------------
 // Session storage helpers
@@ -185,6 +191,48 @@ function notifyLevelUp(newLevel: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Passive Risk Indicators (toolbar badge + icon color)
+// ---------------------------------------------------------------------------
+function updateBrowserActionBadge(tabId: number, level: RiskLevel): void {
+  const badgeConfig: chrome.action.BadgeDetails = {
+    text: level === "danger" ? "⚠️" : level === "warning" ? "!" : "",
+    color: level === "danger" ? "#ef4444" : level === "warning" ? "#f59e0b" : "#22c55e",
+    tabId,
+  };
+  chrome.action.setBadgeText(badgeConfig);
+  chrome.action.setBadgeBackgroundColor({
+    color: badgeConfig.color,
+    tabId,
+  });
+}
+
+function updateToolbarIcon(tabId: number, level: RiskLevel): void {
+  // Generate colored icon using canvas (no external files needed)
+  const colors: Record<RiskLevel, string> = {
+    safe: "#22c55e",
+    warning: "#f59e0b",
+    danger: "#ef4444",
+  };
+
+  // Create SVG icon with shield and status indicator
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+      <circle cx="16" cy="16" r="14" fill="${colors[level]}" stroke="#1a1a1a" stroke-width="2"/>
+      <text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">
+        ${level === "danger" ? "⚠" : level === "warning" ? "!" : "✓"}
+      </text>
+    </svg>
+  `;
+  const svgBlob = new Blob([svg], { type: "image/svg+xml" });
+  const url = URL.createObjectURL(svgBlob);
+
+  chrome.action.setIcon({ path: url, tabId });
+
+  // Clean up blob URL after a delay
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// ---------------------------------------------------------------------------
 // Banner injection
 // ---------------------------------------------------------------------------
 function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
@@ -215,6 +263,17 @@ function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
 // ---------------------------------------------------------------------------
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (!url || !url.startsWith("http")) return;
+
+  // Intelligent analysis: skip internal URLs, use domain caching
+  if (!shouldAnalyzeUrl(url)) {
+    // Check if we have a cached result to restore
+    const cached = getCachedAnalysis(url);
+    if (cached && tabId !== undefined) {
+      setRiskLevel(cached.level);
+    }
+    return;
+  }
+
   if (visitedUrls.has(url)) return;
   visitedUrls.add(url);
 
@@ -241,6 +300,9 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
     console.info(`[AI Hygiene] ML:${mlResult.level}(${mlResult.score.toFixed(3)}) Heuristic:${heuristic.level} [${mlResult.provider}]`);
   }
 
+  // Cache the analysis result for this domain
+  markDomainAnalyzed(url, finalLevel, heuristic.patterns);
+
   // Notify popup of ML result
   chrome.runtime.sendMessage({
     type: "mlRiskResult",
@@ -252,6 +314,12 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   // Inject warning banner if needed
   if (tabId !== undefined && (finalLevel === "danger" || finalLevel === "warning")) {
     injectWarningBanner(tabId, finalLevel);
+  }
+
+  // Update passive indicators (toolbar badge + icon)
+  if (tabId !== undefined) {
+    updateBrowserActionBadge(tabId, finalLevel);
+    updateToolbarIcon(tabId, finalLevel);
   }
 
   try {
@@ -322,7 +390,16 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab?.url) {
       lastAnalyzedUrl = tab.url;
-      setRiskLevel(await loadRiskLevel());
+
+      // Restore risk level from storage
+      const level = await loadRiskLevel();
+      setRiskLevel(level);
+
+      // Restore passive indicators from cache or default to safe
+      const cached = getCachedAnalysis(tab.url);
+      const levelForIcon = cached?.level ?? level;
+      updateBrowserActionBadge(activeInfo.tabId, levelForIcon);
+      updateToolbarIcon(activeInfo.tabId, levelForIcon);
     }
   } catch {
     setRiskLevel("safe");
@@ -354,10 +431,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message.type === "pageScanResult") {
     const { url, signals } = message;
+
+    // Inform analysis strategy about sensitive forms for future analysis decisions
+    try {
+      const domain = new URL(url).hostname;
+      setDomainHasSensitiveForm(domain, signals.hasPasswordField || signals.hasLoginForm);
+    } catch {}
+
     const urlAnalysis = analyzeUrl(url);
     const { level } = contentRiskFromSignals(signals, urlAnalysis);
 
-    // NEW: wire up HTTPS login and HTTP password-field signals from content script
+    // Wire up HTTPS login and HTTP password-field signals from content script
     if (signals.hasPasswordField) {
       if (signals.missingSecurityIndicators) {
         // HTTP + password field — award password-pro badge

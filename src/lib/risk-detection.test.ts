@@ -52,14 +52,24 @@ describe("analyzeUrl - Danger URLs", () => {
 });
 
 describe("analyzeUrl - Warning URLs", () => {
-  it("identifies suspicious TLD without other indicators as warning", () => {
+  it("identifies suspicious TLD without other indicators as safe (low score)", () => {
     const result = analyzeUrl("http://example.tk/page");
-    expect(result.level).toBe("warning");
+    // With weighted scoring, single suspicious TLD scores 20, below warning threshold (35)
+    expect(result.level).toBe("safe");
+    expect(result.score).toBe(20);
   });
 
-  it("identifies HTTP protocol as warning", () => {
+  it("identifies HTTP protocol as safe (low score)", () => {
     const result = analyzeUrl("http://example.com/page");
-    expect(result.level).toBe("warning");
+    // HTTP protocol alone scores 20, below warning threshold (35)
+    expect(result.level).toBe("safe");
+    expect(result.score).toBe(20);
+  });
+
+  it("identifies multiple signals as warning", () => {
+    // HTTP + suspicious TLD = 40 points, above warning threshold (35)
+    const result = analyzeUrl("http://example.tk/page");
+    expect(result.score).toBeGreaterThanOrEqual(35);
   });
 });
 
@@ -188,13 +198,29 @@ describe("contentRiskFromSignals", () => {
 });
 
 describe("Score thresholds", () => {
-  it("danger threshold is score >= 50", () => {
-    expect(analyzeUrl("http://g00gle.com").score).toBeGreaterThanOrEqual(50);
+  it("danger threshold is score >= 65", () => {
+    const result = analyzeUrl("http://g00gle.com");
+    expect(result.level).toBe("danger");
+    expect(result.score).toBeGreaterThanOrEqual(65);
   });
 
-  it("warning threshold is score >= 25", () => {
-    const result = analyzeUrl("http://example.com/page");
-    expect(result.score).toBeGreaterThanOrEqual(25);
+  it("warning threshold is score >= 35", () => {
+    // HTTP + suspicious TLD = 40 points (warning)
+    const result = analyzeUrl("http://example.tk/page");
+    expect(result.score).toBeGreaterThanOrEqual(35);
     expect(result.level).toBe("warning");
+  });
+
+  it("safe with minor concerns is score >= 15", () => {
+    // HTTP alone = 20 points (safe with minor concerns)
+    const result = analyzeUrl("http://example.com/page");
+    expect(result.score).toBeGreaterThanOrEqual(15);
+    expect(result.level).toBe("safe");
+  });
+
+  it("completely safe is score < 15", () => {
+    const result = analyzeUrl("https://google.com");
+    expect(result.score).toBeLessThan(15);
+    expect(result.level).toBe("safe");
   });
 });
