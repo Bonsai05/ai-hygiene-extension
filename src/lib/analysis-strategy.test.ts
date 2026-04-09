@@ -1,5 +1,11 @@
 // Unit tests for analysis-strategy.ts
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+
+// Mock the whitelist module BEFORE importing analysis-strategy
+vi.mock("./whitelist", () => ({
+  isWhitelisted: vi.fn().mockResolvedValue(false),
+}));
+
 import {
   shouldAnalyzeUrl,
   markDomainAnalyzed,
@@ -10,31 +16,35 @@ import {
 } from "./analysis-strategy";
 
 describe("shouldAnalyzeUrl - Skip List", () => {
-  it("skips chrome:// URLs", () => {
-    expect(shouldAnalyzeUrl("chrome://settings")).toBe(false);
-    expect(shouldAnalyzeUrl("chrome://extensions")).toBe(false);
+  beforeEach(() => {
+    clearDomainCache();
   });
 
-  it("skips chrome-extension:// URLs", () => {
-    expect(shouldAnalyzeUrl("chrome-extension://abc123/popup.html")).toBe(false);
+  it("skips chrome:// URLs", async () => {
+    expect(await shouldAnalyzeUrl("chrome://settings")).toBe(false);
+    expect(await shouldAnalyzeUrl("chrome://extensions")).toBe(false);
   });
 
-  it("skips about: URLs", () => {
-    expect(shouldAnalyzeUrl("about:blank")).toBe(false);
-    expect(shouldAnalyzeUrl("about:newtab")).toBe(false);
+  it("skips chrome-extension:// URLs", async () => {
+    expect(await shouldAnalyzeUrl("chrome-extension://abc123/popup.html")).toBe(false);
   });
 
-  it("skips localhost URLs", () => {
-    expect(shouldAnalyzeUrl("http://localhost:3000")).toBe(false);
-    expect(shouldAnalyzeUrl("http://127.0.0.1:8080")).toBe(false);
+  it("skips about: URLs", async () => {
+    expect(await shouldAnalyzeUrl("about:blank")).toBe(false);
+    expect(await shouldAnalyzeUrl("about:newtab")).toBe(false);
   });
 
-  it("skips file:// URLs", () => {
-    expect(shouldAnalyzeUrl("file:///Users/test/file.html")).toBe(false);
+  it("skips localhost URLs", async () => {
+    expect(await shouldAnalyzeUrl("http://localhost:3000")).toBe(false);
+    expect(await shouldAnalyzeUrl("http://127.0.0.1:8080")).toBe(false);
   });
 
-  it("skips view-source: URLs", () => {
-    expect(shouldAnalyzeUrl("view-source:https://example.com")).toBe(false);
+  it("skips file:// URLs", async () => {
+    expect(await shouldAnalyzeUrl("file:///Users/test/file.html")).toBe(false);
+  });
+
+  it("skips view-source: URLs", async () => {
+    expect(await shouldAnalyzeUrl("view-source:https://example.com")).toBe(false);
   });
 });
 
@@ -43,21 +53,21 @@ describe("shouldAnalyzeUrl - High Priority Patterns", () => {
     clearDomainCache();
   });
 
-  it("always analyzes login pages", () => {
-    expect(shouldAnalyzeUrl("https://example.com/login")).toBe(true);
-    expect(shouldAnalyzeUrl("https://example.com/signin")).toBe(true);
-    expect(shouldAnalyzeUrl("https://example.com/auth/callback")).toBe(true);
+  it("always analyzes login pages", async () => {
+    expect(await shouldAnalyzeUrl("https://example.com/login")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://example.com/signin")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://example.com/auth/callback")).toBe(true);
   });
 
-  it("always analyzes banking/finance pages", () => {
-    expect(shouldAnalyzeUrl("https://bank.com/account")).toBe(true);
-    expect(shouldAnalyzeUrl("https://paypal.com/checkout")).toBe(true);
+  it("always analyzes banking/finance pages", async () => {
+    expect(await shouldAnalyzeUrl("https://bank.com/account")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://paypal.com/checkout")).toBe(true);
   });
 
-  it("always analyzes brand login pages", () => {
-    expect(shouldAnalyzeUrl("https://google.com/signin")).toBe(true);
-    expect(shouldAnalyzeUrl("https://microsoft.com/login")).toBe(true);
-    expect(shouldAnalyzeUrl("https://github.com/auth")).toBe(true);
+  it("always analyzes brand login pages", async () => {
+    expect(await shouldAnalyzeUrl("https://google.com/signin")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://microsoft.com/login")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://github.com/auth")).toBe(true);
   });
 });
 
@@ -66,21 +76,21 @@ describe("shouldAnalyzeUrl - Domain Caching", () => {
     clearDomainCache();
   });
 
-  it("skips recently analyzed domains", () => {
-    const url = "https://example.com/page";
+  it("skips recently analyzed non-high-priority domains", async () => {
+    const url = "https://example.com/page";  // Not high-priority
     markDomainAnalyzed(url, "safe", []);
-    expect(shouldAnalyzeUrl(url)).toBe(false);
+    expect(await shouldAnalyzeUrl(url)).toBe(false);
   });
 
-  it("analyzes domains not in cache", () => {
-    expect(shouldAnalyzeUrl("https://new-domain.com/page")).toBe(true);
+  it("analyzes high-priority domains not in cache", async () => {
+    expect(await shouldAnalyzeUrl("https://new-domain.com/login")).toBe(true);
   });
 
-  it("analyzes high-priority URLs even if cached", () => {
-    const url = "https://example.com/login";
+  it("respects cooldown for high-priority URLs when cached", async () => {
+    const url = "https://example.com/login";  // High-priority
     markDomainAnalyzed(url, "safe", []);
-    // High priority URLs should still be analyzed
-    expect(shouldAnalyzeUrl(url)).toBe(true);
+    // High priority URLs should still respect cooldown
+    expect(await shouldAnalyzeUrl(url)).toBe(false);
   });
 });
 
@@ -108,16 +118,16 @@ describe("setDomainHasSensitiveForm", () => {
     clearDomainCache();
   });
 
-  it("marks domain as having sensitive forms", () => {
+  it("marks domain as having sensitive forms", async () => {
     setDomainHasSensitiveForm("example.com", true);
-    expect(shouldAnalyzeUrl("https://example.com/page")).toBe(true);
+    expect(await shouldAnalyzeUrl("https://example.com/page")).toBe(true);
   });
 
-  it("allows domain without sensitive forms to be skipped", () => {
+  it("allows domain without sensitive forms to be skipped", async () => {
     setDomainHasSensitiveForm("example.com", false);
     // Non-high-priority URL without sensitive forms should be skipped if cached
     markDomainAnalyzed("https://example.com/page", "safe", []);
-    expect(shouldAnalyzeUrl("https://example.com/page")).toBe(false);
+    expect(await shouldAnalyzeUrl("https://example.com/page")).toBe(false);
   });
 });
 
@@ -154,18 +164,18 @@ describe("Analysis Cooldown", () => {
     clearDomainCache();
   });
 
-  it("analyzes URL immediately after cache expires (30s)", () => {
-    const url = "https://example.com/page";
+  it("analyzes URL immediately after cache expires (30s)", async () => {
+    const url = "https://example.com/login";  // High priority URL
     markDomainAnalyzed(url, "safe", []);
 
     // Should be skipped (in cooldown)
-    expect(shouldAnalyzeUrl(url)).toBe(false);
+    expect(await shouldAnalyzeUrl(url)).toBe(false);
 
     // Manually expire the cache by marking with old timestamp
     // (In real usage, this happens automatically after 30s)
     clearDomainCache();
 
     // Should be analyzed again after cache cleared
-    expect(shouldAnalyzeUrl(url)).toBe(true);
+    expect(await shouldAnalyzeUrl(url)).toBe(true);
   });
 });

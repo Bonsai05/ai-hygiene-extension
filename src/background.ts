@@ -28,8 +28,9 @@ import {
   getLevelTitle,
   getXpToNextLevel,
   getNewlyEarnedBadges,
-  XP_REWARDS,
 } from "./lib/gamification";
+import { canAwardXp } from "./lib/storage";
+import { XP_REWARDS } from "./lib/constants";
 import { showBrowserNotification } from "./lib/notifications";
 import {
   shouldAnalyzeUrl,
@@ -264,8 +265,9 @@ function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (!url || !url.startsWith("http")) return;
 
-  // Intelligent analysis: skip internal URLs, use domain caching
-  if (!shouldAnalyzeUrl(url)) {
+  // Intelligent analysis: skip internal URLs, use domain caching, check whitelist
+  const shouldAnalyze = await shouldAnalyzeUrl(url);
+  if (!shouldAnalyze) {
     // Check if we have a cached result to restore
     const cached = getCachedAnalysis(url);
     if (cached && tabId !== undefined) {
@@ -331,23 +333,34 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
       after = await applyDangerPenalty(before);
       await saveStats(after);
       await saveRiskEvent({ url, riskLevel: "danger", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: -XP_REWARDS.DANGER_PENALTY });
-      await notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
+
+      // Rate limit XP loss notifications
+      if (canAwardXp()) {
+        await notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
+      }
       setRiskLevel("danger");
       return;
     }
 
-    if (finalLevel === "warning") {
-      after = await awardSafeBrowsingXp(before);
-      await saveStats(after);
-      await saveRiskEvent({ url, riskLevel: "warning", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
-      if (after.safeBrowsingStreak > 1) {
-        await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
+    // Rate limit XP awards to prevent rapid-fire exploitation
+    if (canAwardXp()) {
+      if (finalLevel === "warning") {
+        after = await awardSafeBrowsingXp(before);
+        await saveStats(after);
+        await saveRiskEvent({ url, riskLevel: "warning", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
+        if (after.safeBrowsingStreak > 1) {
+          await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
+        }
+      } else {
+        after = await awardSafeBrowsingXp(before);
+        await saveStats(after);
+        await saveRiskEvent({ url, riskLevel: "safe", detectedPatterns: [], timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
+        await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
       }
     } else {
-      after = await awardSafeBrowsingXp(before);
-      await saveStats(after);
-      await saveRiskEvent({ url, riskLevel: "safe", detectedPatterns: [], timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
-      await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
+      // Still save the risk event, just skip XP award
+      after = before;
+      await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: 0 });
     }
 
     announceNewBadges(before, after);

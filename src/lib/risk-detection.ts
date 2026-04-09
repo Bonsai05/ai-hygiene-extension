@@ -3,6 +3,15 @@
 //
 // Phase 2B: Weighted scoring system with contextual modifiers to reduce false positives
 
+import {
+  RISK_WEIGHTS,
+  CONTEXT_MODIFIERS,
+  KNOWN_BRANDS,
+  TYPOSQUAT_PATTERNS,
+  SUSPICIOUS_TLDS,
+  RISK_THRESHOLDS,
+} from "./constants";
+
 export type RiskLevel = "safe" | "warning" | "danger";
 
 export interface RiskAnalysis {
@@ -14,67 +23,7 @@ export interface RiskAnalysis {
 
 // --- Weighted Scoring System ---
 // Each signal has a weight based on its reliability as a phishing indicator
-
-const RISK_WEIGHTS = {
-    // CRITICAL (never a false positive)
-    TYPOSQUAT: 60,
-    PASSWORD_ON_HTTP: 50,
-    DATA_URI: 50,
-
-    // HIGH (strong phishing indicators)
-    IP_HOSTNAME: 35,
-    EXTERNAL_FORM_ACTION: 30,
-    URGENT_LANGUAGE_3_PLUS: 30,
-
-    // MEDIUM (worth noting)
-    HTTP_PROTOCOL: 20,
-    SUSPICIOUS_TLD: 20,
-    EXCESSIVE_SUBDOMAINS: 20,
-    REDIRECT_PARAM: 15,
-
-    // LOW (minor concerns)
-    LONG_URL: 10,
-    BRAND_KEYWORD_PATH: 10,
-} as const;
-
-// Context modifiers that amplify risk when multiple signals present
-const CONTEXT_MODIFIERS = {
-    knownBrandInUrl: 1.5,      // Brand + suspicious = more likely phishing
-    hasUserInputFields: 1.3,   // Forms increase stakes
-    multipleSignals: 1.2,      // 3+ signals = compound risk
-} as const;
-
-// Known brands that phishers commonly impersonate
-const KNOWN_BRANDS = [
-    "google",
-    "microsoft",
-    "apple",
-    "amazon",
-    "facebook",
-    "meta",
-    "paypal",
-    "stripe",
-    "netflix",
-    "spotify",
-    "dropbox",
-    "adobe",
-    "github",
-] as const;
-
-// Typosquatting patterns (common misspellings of popular brands)
-const TYPOSQUAT_PATTERNS = [
-    /g00gle/,
-    /googl[e3]/,
-    /faceb00k/,
-    /facebok/,
-    /twltter/,
-    /l1nkedin/,
-    /amaz0n/,
-    /paypa1/,
-    /app1e/,
-    /micros0ft/,
-    /g00g1e/,
-];
+// (Imported from constants.ts for single source of truth)
 
 /**
  * Detect typosquatting attempts in hostname
@@ -91,6 +40,9 @@ function containsBrandKeywords(hostname: string): boolean {
     const lower = hostname.toLowerCase();
     return KNOWN_BRANDS.some((brand) => lower.includes(brand));
 }
+
+// Re-export constants for use in other modules
+export { KNOWN_BRANDS, TYPOSQUAT_PATTERNS };
 
 /**
  * Analyze URL with weighted scoring system
@@ -117,6 +69,12 @@ export function analyzeUrl(url: string): RiskAnalysis {
         if (parsed.protocol === "data:") {
             score += RISK_WEIGHTS.DATA_URI;
             patterns.push("data_uri");
+        }
+
+        // URL with @ symbol (credentials in URL — common phishing technique)
+        if (url.includes("@")) {
+            score += RISK_WEIGHTS.URL_WITH_AT;
+            patterns.push("url_with_at_symbol");
         }
 
         // --- HIGH SIGNALS ---
@@ -167,21 +125,18 @@ export function analyzeUrl(url: string): RiskAnalysis {
             patterns.push("long_url");
         }
 
-        // Brand keywords in suspicious path context
-        const phishingKeywords = ["login", "signin", "account", "verify", "secure"];
-        if (phishingKeywords.some((k) => pathLower.includes(k)) && containsBrandKeywords(hostname)) {
-            score += RISK_WEIGHTS.BRAND_KEYWORD_PATH;
-            patterns.push("brand_keyword_path");
-        }
+        // Brand keywords in suspicious path context - removed to avoid false positives
+        // Legitimate brand login pages (e.g., accounts.google.com/signin) should not be flagged
+        // Typosquatting attempts are already caught by detectTyposquatting()
 
         // --- CONTEXT MODIFIERS ---
 
         if (containsBrandKeywords(hostname)) {
-            contextMultiplier *= CONTEXT_MODIFIERS.knownBrandInUrl;
+            contextMultiplier *= CONTEXT_MODIFIERS.KNOWN_BRAND;
         }
 
         if (patterns.length >= 3) {
-            contextMultiplier *= CONTEXT_MODIFIERS.multipleSignals;
+            contextMultiplier *= CONTEXT_MODIFIERS.MULTIPLE_SIGNALS;
         }
 
         // Apply context multiplier
@@ -193,13 +148,13 @@ export function analyzeUrl(url: string): RiskAnalysis {
         let level: RiskLevel = "safe";
         let reason: string;
 
-        if (score >= 65) {
+        if (score >= RISK_THRESHOLDS.DANGER) {
             level = "danger";
             reason = "High-risk phishing indicators detected.";
-        } else if (score >= 35) {
+        } else if (score >= RISK_THRESHOLDS.WARNING) {
             level = "warning";
             reason = "Some suspicious patterns found. Proceed with caution.";
-        } else if (score >= 15) {
+        } else if (score >= RISK_THRESHOLDS.MINOR) {
             level = "safe";
             reason = "Minor concerns detected, but likely safe.";
         } else {
@@ -370,9 +325,9 @@ export function contentRiskFromSignals(
     let level: RiskLevel = "safe";
     let xpAwarded = 0;
 
-    if (score >= 65) {
+    if (score >= RISK_THRESHOLDS.DANGER) {
         level = "danger";
-    } else if (score >= 35) {
+    } else if (score >= RISK_THRESHOLDS.WARNING) {
         level = "warning";
     }
 

@@ -62,6 +62,7 @@ export function RiskStatus() {
             color: 'text-success',
             borderColor: 'border-success',
             bgColor: 'bg-success/10',
+            pattern: 'bg-[repeating-linear-gradient(45deg,transparent,transparent_2px,rgba(34,197,94,0.1)_2px,rgba(34,197,94,0.1)_4px)]',
         },
         warning: {
             icon: AlertTriangle,
@@ -69,6 +70,7 @@ export function RiskStatus() {
             color: 'text-warning',
             borderColor: 'border-warning',
             bgColor: 'bg-warning/10',
+            pattern: 'bg-[repeating-linear-gradient(45deg,rgba(251,191,36,0.1)_0px,rgba(251,191,36,0.1)_2px,transparent_2px,transparent_4px)]',
         },
         danger: {
             icon: AlertCircle,
@@ -76,6 +78,7 @@ export function RiskStatus() {
             color: 'text-destructive',
             borderColor: 'border-destructive',
             bgColor: 'bg-destructive/10',
+            pattern: 'bg-[repeating-linear-gradient(45deg,rgba(248,113,113,0.1)_0px,rgba(248,113,113,0.1)_4px,transparent_4px,transparent_8px)]',
         },
     };
 
@@ -83,7 +86,7 @@ export function RiskStatus() {
     const Icon = config.icon;
 
     return (
-        <div className={`p-4 border-2 ${config.borderColor} ${config.bgColor} flex flex-col gap-2`}>
+        <div className={`p-4 border-2 ${config.borderColor} ${config.bgColor} ${config.pattern} flex flex-col gap-2`}>
             <h2 className="text-xs text-muted-foreground uppercase font-mono tracking-widest font-bold">
                 RISK STATUS
             </h2>

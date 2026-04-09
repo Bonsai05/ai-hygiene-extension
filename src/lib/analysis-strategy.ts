@@ -4,6 +4,8 @@
 // Problem: Analyzing EVERY page load causes performance degradation and alert fatigue
 // Solution: Skip internal URLs, cache domain results, prioritize high-value targets
 
+import { isWhitelisted } from "./whitelist";
+
 /**
  * Sites to NEVER analyze (skip list)
  * These are internal/safe URLs that should never trigger analysis
@@ -57,7 +59,12 @@ const domainHasSensitiveForms = new Map<string, boolean>();
 /**
  * Check if a URL should be analyzed based on intelligent filtering
  */
-export function shouldAnalyzeUrl(url: string): boolean {
+export async function shouldAnalyzeUrl(url: string): Promise<boolean> {
+  // 0. Check whitelist first (user-trusted domains)
+  if (await isWhitelisted(url)) {
+    return false;
+  }
+
   // 1. Skip internal/safe URLs
   if (SKIP_LIST.some((skip) => url.startsWith(skip))) {
     return false;
@@ -73,7 +80,7 @@ export function shouldAnalyzeUrl(url: string): boolean {
       return false;
     }
 
-    // 3. Always analyze high-priority URLs
+    // 3. Check high-priority patterns (always analyze these when not in cooldown)
     const isHighPriority = HIGH_PRIORITY_PATTERNS.some((p) => p.test(url));
     if (isHighPriority) {
       return true;
