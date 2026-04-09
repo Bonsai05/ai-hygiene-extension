@@ -14,6 +14,7 @@ import {
   loadRiskLevel,
   saveRiskLevel,
   saveRiskEvent,
+  canAwardXp,
   type UserStats,
 } from "./lib/storage";
 import { analyzeUrl, contentRiskFromSignals, type RiskLevel } from "./lib/risk-detection";
@@ -43,8 +44,8 @@ import {
 const VISITED_KEY = "visitedUrls";
 const DANGER_TABS_KEY = "dangerTabs";
 
-// In-memory visited URLs cache (supplements session storage)
-const visitedUrls = new Set<string>();
+// Track blob URLs per tab to prevent memory leaks
+const iconBlobUrls = new Map<number, string>();
 
 async function wasRecentlyVisited(url: string): Promise<boolean> {
   const r = await chrome.storage.session.get([VISITED_KEY]);
@@ -79,22 +80,42 @@ interface BackendMLResult {
   provider: string;
 }
 
+// Deduplicate concurrent requests for the same URL
+const pendingBackendRequests = new Map<string, Promise<BackendMLResult | null>>();
+
 async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | null> {
-  try {
-    const res = await fetch(`${DEFAULT_BACKEND_URL}/analyze/url`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    if (!res.ok) throw new Error("offline");
-    const data = await res.json();
-    const score: number = data.phishing_score ?? data.score / 100 ?? 0;
-    const level: "safe" | "warning" | "danger" =
-      score >= 0.7 ? "danger" : score >= 0.3 ? "warning" : "safe";
-    return { level, score, provider: data.provider ?? "Local FastAPI" };
-  } catch {
-    return null;
-  }
+  // Deduplicate: return existing promise if request is already in flight
+  const existing = pendingBackendRequests.get(url);
+  if (existing) return existing;
+
+  const request = (async () => {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      const res = await fetch(`${DEFAULT_BACKEND_URL}/analyze/url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) throw new Error("offline");
+      const data = await res.json();
+      const score: number = data.phishing_score ?? data.score / 100 ?? 0;
+      const level: "safe" | "warning" | "danger" =
+        score >= 0.7 ? "danger" : score >= 0.3 ? "warning" : "safe";
+      return { level, score, provider: data.provider ?? "Local FastAPI" };
+    } catch {
+      return null;
+    } finally {
+      pendingBackendRequests.delete(url);
+    }
+  })();
+
+  pendingBackendRequests.set(url, request);
+  return request;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +143,7 @@ async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult |
     return {
       level: result.level,
       score: result.score,
-      provider: result.modelVersion ?? 'Transformers.js (WASM)',
+      provider: result.provider ?? result.modelVersion ?? 'Transformers.js (WASM)',
     };
   } catch (err) {
     console.warn('[AI Hygiene] Offscreen ML failed:', err);
@@ -193,6 +214,10 @@ function updateBrowserActionBadge(tabId: number, level: RiskLevel): void {
 }
 
 function updateToolbarIcon(tabId: number, level: RiskLevel): void {
+  // Track blob URLs per tab to prevent memory leaks
+  const prevUrl = iconBlobUrls.get(tabId);
+  if (prevUrl) URL.revokeObjectURL(prevUrl);
+
   // Generate colored icon using canvas (no external files needed)
   const colors: Record<RiskLevel, string> = {
     safe: "#22c55e",
@@ -211,11 +236,9 @@ function updateToolbarIcon(tabId: number, level: RiskLevel): void {
   `;
   const svgBlob = new Blob([svg], { type: "image/svg+xml" });
   const url = URL.createObjectURL(svgBlob);
+  iconBlobUrls.set(tabId, url);
 
   chrome.action.setIcon({ path: url, tabId });
-
-  // Clean up blob URL after a delay
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,9 +312,6 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   }
 
   // Skip if already visited in this session
-  if (visitedUrls.has(url)) return;
-  visitedUrls.add(url);
-
   if (await wasRecentlyVisited(url)) return;
   await markVisited(url);
 
@@ -362,7 +382,7 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
 
     // Rate limit XP gain NOTIFICATIONS (still award the XP)
     if (canAwardXp()) {
-      if (finalLevel === "warning" && after.safeBrowsingStreak > 1) {
+      if (finalLevel === "warning") {
         await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
       } else if (finalLevel === "safe") {
         await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
@@ -428,7 +448,11 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 // ---------------------------------------------------------------------------
 // Message handlers
 // ---------------------------------------------------------------------------
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: Record<string, unknown>, _sender, sendResponse) => {
+  if (typeof message.type !== "string") {
+    return false;
+  }
+
   if (message.type === "getRiskLevel") {
     loadRiskLevel().then(level => sendResponse({ level }));
     return true;

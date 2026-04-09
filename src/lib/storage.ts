@@ -265,9 +265,12 @@ export async function loadRiskEvents(): Promise<RiskEvent[]> {
 }
 
 export async function saveRiskEvent(event: RiskEvent): Promise<void> {
-  const existing = await loadRiskEvents();
-  const updated = [event, ...existing].slice(0, 50);
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ [STORAGE_KEYS.RISK_EVENTS]: updated }, resolve);
+  return updateStats(async (stats) => {
+    const existing = await loadRiskEvents();
+    const updated = [event, ...existing].slice(0, 50);
+    await new Promise<void>((resolve) => {
+      chrome.storage.local.set({ [STORAGE_KEYS.RISK_EVENTS]: updated }, resolve);
+    });
+    return stats;
   });
 }

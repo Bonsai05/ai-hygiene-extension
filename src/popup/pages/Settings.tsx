@@ -42,7 +42,18 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   });
 
   const [backendStatus, setBackendStatus] = useState<"unknown" | "running" | "offline">("unknown");
+  const [urlError, setUrlError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  const isValidBackendUrl = (url: string): boolean => {
+    if (!url) return true;
+    try {
+      const parsed = new URL(url);
+      return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+    } catch {
+      return false;
+    }
+  };
 
   const loadSettings = useCallback(async () => {
     try {
@@ -198,10 +209,21 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               <input
                 type="text"
                 value={backend.backendUrl}
-                onChange={(e) => setBackend((s) => ({ ...s, backendUrl: e.target.value }))}
-                className="mt-1 w-full px-3 py-2 border border-input bg-background rounded-md text-sm"
+                onChange={(e) => {
+                  const newUrl = e.target.value;
+                  if (isValidBackendUrl(newUrl)) {
+                    setUrlError(null);
+                    setBackend((s) => ({ ...s, backendUrl: newUrl }));
+                  } else {
+                    setUrlError("Only 127.0.0.1 or localhost allowed");
+                  }
+                }}
+                className={`mt-1 w-full px-3 py-2 border rounded-md text-sm bg-background ${
+                  urlError ? "border-destructive" : "border-input"
+                }`}
                 placeholder={DEFAULT_BACKEND_URL}
               />
+              {urlError && <p className="text-xs text-destructive mt-1">{urlError}</p>}
             </div>
 
             <div className="flex gap-2">

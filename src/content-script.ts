@@ -109,6 +109,11 @@ function sendPageSignals(signals: PageRiskSignals, url: string) {
 }
 
 function scanPage() {
+    // Skip analysis for trivial/empty pages
+    if (document.body === null || document.body.children.length === 0) {
+        return;
+    }
+
     try {
         const signals = analyzePageContent();
         sendPageSignals(signals, window.location.href);

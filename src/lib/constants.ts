@@ -230,37 +230,3 @@ export const SUSPICIOUS_PHRASES = [
   "security alert",
   "urgent action required",
 ] as const;
-
-// ---------------------------------------------------------------------------
-// Phishing keywords (for URL path detection)
-// ---------------------------------------------------------------------------
-export const PHISHING_KEYWORDS = [
-  "login",
-  "signin",
-  "account",
-  "verify",
-  "secure",
-  "update",
-  "confirm",
-  "banking",
-  "password",
-  "credential",
-] as const;
-
-// ---------------------------------------------------------------------------
-// Default badge catalog (12 badges)
-// ---------------------------------------------------------------------------
-export const DEFAULT_BADGES = [
-  { id: "safe-surfer", name: "Safe Surfer", description: "Browse your first page safely", tier: "bronze", category: "habit", icon: "shield" },
-  { id: "streak-starter", name: "Streak Starter", description: "10 page safe streak", tier: "bronze", category: "streak", icon: "award" },
-  { id: "streak-veteran", name: "Streak Veteran", description: "25 page safe streak", tier: "silver", category: "streak", icon: "award" },
-  { id: "streak-legend", name: "Streak Legend", description: "50 page safe streak", tier: "gold", category: "streak", icon: "award" },
-  { id: "phish-spotter", name: "Phish Spotter", description: "Avoid your first phishing attempt", tier: "bronze", category: "threat", icon: "eye" },
-  { id: "danger-survivor", name: "Danger Survivor", description: "Avoid 3 danger sites", tier: "silver", category: "threat", icon: "shield" },
-  { id: "threat-hunter", name: "Threat Hunter", description: "Avoid 10 threats", tier: "gold", category: "threat", icon: "eye" },
-  { id: "secure-login", name: "Secure Login", description: "Use HTTPS for login", tier: "bronze", category: "habit", icon: "lock" },
-  { id: "password-pro", name: "Password Pro", description: "Detected password field on HTTP", tier: "bronze", category: "habit", icon: "key" },
-  { id: "recovery-hero", name: "Recovery Hero", description: "Complete panic recovery", tier: "bronze", category: "recovery", icon: "zap" },
-  { id: "bounce-back", name: "Bounce Back", description: "3 recoveries completed", tier: "silver", category: "recovery", icon: "check" },
-  { id: "hygiene-master", name: "Hygiene Master", description: "Reach Level 5", tier: "gold", category: "habit", icon: "award" },
-] as const;

@@ -123,6 +123,7 @@ export async function shouldAnalyzeUrl(url: string): Promise<AnalysisDecision> {
     // 5. Default: don't re-analyze, but return cached result if available
     return { shouldAnalyze: false, cachedResult: cached };
   } catch {
+    console.warn("[AnalysisStrategy] Failed to parse URL:", url);
     return { shouldAnalyze: false };
   }
 }
@@ -142,8 +143,8 @@ export function markDomainAnalyzed(
       level,
       patterns,
     });
-  } catch {
-    // Invalid URL, skip caching
+  } catch (e) {
+    console.warn("[AnalysisStrategy] Failed to cache analysis for URL:", url, e);
   }
 }
 
@@ -154,7 +155,8 @@ export function getCachedAnalysis(url: string): CachedAnalysis | null {
   try {
     const domain = new URL(url).hostname;
     return analyzedDomains.get(domain) ?? null;
-  } catch {
+  } catch (e) {
+    console.warn("[AnalysisStrategy] Failed to get cached analysis for URL:", url, e);
     return null;
   }
 }
