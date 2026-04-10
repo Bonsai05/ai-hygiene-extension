@@ -9,6 +9,7 @@ import {
   KNOWN_BRANDS,
   TYPOSQUAT_PATTERNS,
   SUSPICIOUS_TLDS,
+  SUSPICIOUS_PHRASES,
   RISK_THRESHOLDS,
 } from "./constants";
 
@@ -55,7 +56,6 @@ export function analyzeUrl(url: string): RiskAnalysis {
     try {
         const parsed = new URL(url);
         const hostname = parsed.hostname;
-        const pathLower = (parsed.pathname + parsed.search).toLowerCase();
 
         // --- CRITICAL SIGNALS ---
 
@@ -87,9 +87,8 @@ export function analyzeUrl(url: string): RiskAnalysis {
 
         // --- MEDIUM SIGNALS ---
 
-        // Suspicious TLD
-        const suspiciousTlds = [".tk", ".ml", ".ga", ".cf", ".gq", ".xyz", ".top", ".work"];
-        if (suspiciousTlds.some((t) => hostname.endsWith(t))) {
+        // Suspicious TLD - using constant from constants.ts
+        if (SUSPICIOUS_TLDS.some((t) => hostname.endsWith(t))) {
             score += RISK_WEIGHTS.SUSPICIOUS_TLD;
             patterns.push("suspicious_tld");
         }
@@ -130,8 +129,15 @@ export function analyzeUrl(url: string): RiskAnalysis {
         // Typosquatting attempts are already caught by detectTyposquatting()
 
         // --- CONTEXT MODIFIERS ---
+        // NOTE: Brand modifier only applies to NON-CRITICAL signals.
+        // Typoquatting, password-on-HTTP, and data URI are ALWAYS dangerous.
 
-        if (containsBrandKeywords(hostname)) {
+        const hasCriticalSignal = patterns.some(p =>
+            ['typosquatting', 'password_field_http', 'data_uri'].includes(p)
+        );
+
+        // Only apply brand reduction for legitimate sites (without critical signals)
+        if (containsBrandKeywords(hostname) && !hasCriticalSignal) {
             contextMultiplier *= CONTEXT_MODIFIERS.KNOWN_BRAND;
         }
 
@@ -215,7 +221,6 @@ export function analyzePageContent(): PageRiskSignals {
 
     // Check form action destinations
     try {
-        const currentHost = window.location.hostname;
         for (const form of forms) {
             const action = form.getAttribute("action") || "";
             if (
@@ -234,22 +239,8 @@ export function analyzePageContent(): PageRiskSignals {
     }
 
     // Suspicious phrases on page
-    const suspiciousTextPatterns = [
-        "verify your account",
-        "confirm your identity",
-        "update your information",
-        "suspend your account",
-        "unusual activity",
-        "verify your password",
-        "click here to verify",
-        "your account has been",
-        "confirm your account",
-        "security alert",
-        "urgent action required",
-    ];
-
     const bodyText = document.body?.innerText?.toLowerCase() || "";
-    for (const phrase of suspiciousTextPatterns) {
+    for (const phrase of SUSPICIOUS_PHRASES) {
         if (bodyText.includes(phrase)) {
             signals.suspiciousPhrases.push(phrase);
         }
@@ -280,13 +271,14 @@ export function analyzePageContent(): PageRiskSignals {
 }
 
 // --- Content script risk scoring ---
+// NOTE: XP is awarded in background.ts via awardSafeBrowsingXp(), not here.
+// This function only determines risk level and patterns.
 export function contentRiskFromSignals(
     signals: PageRiskSignals,
     urlAnalysis: RiskAnalysis
 ): {
     level: RiskLevel;
     patterns: string[];
-    xpAwarded: number;
 } {
     let score = urlAnalysis.score;
     const patterns = [...urlAnalysis.patterns];
@@ -323,7 +315,6 @@ export function contentRiskFromSignals(
 
     // Level determination (aligned with URL analysis thresholds)
     let level: RiskLevel = "safe";
-    let xpAwarded = 0;
 
     if (score >= RISK_THRESHOLDS.DANGER) {
         level = "danger";
@@ -331,10 +322,5 @@ export function contentRiskFromSignals(
         level = "warning";
     }
 
-    // Award XP if user avoided a danger/warning
-    if (level === "safe") {
-        xpAwarded = 5; // Safe browsing base XP
-    }
-
-    return { level, patterns, xpAwarded };
+    return { level, patterns };
 }

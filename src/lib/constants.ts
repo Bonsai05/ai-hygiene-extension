@@ -8,6 +8,11 @@ export const EXTENSION_NAME = "AI Hygiene Companion";
 export const EXTENSION_VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+export const DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
+
+// ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
 export const STORAGE_KEYS = {
@@ -76,7 +81,7 @@ export const RISK_WEIGHTS = {
 // Context modifiers (for weighted scoring)
 // ---------------------------------------------------------------------------
 export const CONTEXT_MODIFIERS = {
-  KNOWN_BRAND: 1.5,    // Brand + suspicious = more likely phishing
+  KNOWN_BRAND: 0.5,    // Brand keywords REDUCE risk (legitimate sites)
   HAS_USER_INPUT: 1.3, // Forms increase stakes
   MULTIPLE_SIGNALS: 1.2, // 3+ signals = compound risk
 } as const;
@@ -210,35 +215,18 @@ export const TYPOSQUAT_PATTERNS = [
 ] as const;
 
 // ---------------------------------------------------------------------------
-// Phishing keywords (for URL path detection)
+// Suspicious phrases (for page content scanning)
 // ---------------------------------------------------------------------------
-export const PHISHING_KEYWORDS = [
-  "login",
-  "signin",
-  "account",
-  "verify",
-  "secure",
-  "update",
-  "confirm",
-  "banking",
-  "password",
-  "credential",
-] as const;
-
-// ---------------------------------------------------------------------------
-// Default badge catalog (12 badges)
-// ---------------------------------------------------------------------------
-export const DEFAULT_BADGES = [
-  { id: "safe-surfer", name: "Safe Surfer", description: "Browse your first page safely", tier: "bronze", category: "habit", icon: "shield" },
-  { id: "streak-starter", name: "Streak Starter", description: "10 page safe streak", tier: "bronze", category: "streak", icon: "award" },
-  { id: "streak-veteran", name: "Streak Veteran", description: "25 page safe streak", tier: "silver", category: "streak", icon: "award" },
-  { id: "streak-legend", name: "Streak Legend", description: "50 page safe streak", tier: "gold", category: "streak", icon: "award" },
-  { id: "phish-spotter", name: "Phish Spotter", description: "Avoid your first phishing attempt", tier: "bronze", category: "threat", icon: "eye" },
-  { id: "danger-survivor", name: "Danger Survivor", description: "Avoid 3 danger sites", tier: "silver", category: "threat", icon: "shield" },
-  { id: "threat-hunter", name: "Threat Hunter", description: "Avoid 10 threats", tier: "gold", category: "threat", icon: "eye" },
-  { id: "secure-login", name: "Secure Login", description: "Use HTTPS for login", tier: "bronze", category: "habit", icon: "lock" },
-  { id: "password-pro", name: "Password Pro", description: "Detected password field on HTTP", tier: "bronze", category: "habit", icon: "key" },
-  { id: "recovery-hero", name: "Recovery Hero", description: "Complete panic recovery", tier: "bronze", category: "recovery", icon: "zap" },
-  { id: "bounce-back", name: "Bounce Back", description: "3 recoveries completed", tier: "silver", category: "recovery", icon: "check" },
-  { id: "hygiene-master", name: "Hygiene Master", description: "Reach Level 5", tier: "gold", category: "habit", icon: "award" },
+export const SUSPICIOUS_PHRASES = [
+  "verify your account",
+  "confirm your identity",
+  "update your information",
+  "suspend your account",
+  "unusual activity",
+  "verify your password",
+  "click here to verify",
+  "your account has been",
+  "confirm your account",
+  "security alert",
+  "urgent action required",
 ] as const;

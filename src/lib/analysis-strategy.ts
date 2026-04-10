@@ -5,43 +5,46 @@
 // Solution: Skip internal URLs, cache domain results, prioritize high-value targets
 
 import { isWhitelisted } from "./whitelist";
+import { SKIP_LIST, HIGH_PRIORITY_PATTERNS, TIMINGS } from "./constants";
 
 /**
- * Sites to NEVER analyze (skip list)
- * These are internal/safe URLs that should never trigger analysis
+ * Known-safe domains that are verified legitimate sites
+ * These will always be marked as safe without analysis
  */
-const SKIP_LIST = [
-  'chrome://',
-  'chrome-extension://',
-  'about:',
-  'edge:',
-  'chrome-search://',
-  'localhost',
-  '127.0.0.1',
-  'newtab',
-  'blank',
-  'devtools',
-  'file://',
-  'view-source:',
-];
-
-/**
- * Sites to ALWAYS analyze (high-value targets)
- * These patterns indicate pages that are common phishing targets
- */
-const HIGH_PRIORITY_PATTERNS = [
-  /login|signin|auth|account|verify|secure/i,
-  /bank|finance|payment|checkout|paypal|stripe/i,
-  /google|microsoft|apple|amazon|facebook|meta/i,
-  /netflix|spotify|dropbox|adobe|github/i,
-  /crypto|wallet|blockchain|coinbase/i,
-];
-
-/**
- * Minimum time between analyses per domain (30 seconds)
- * Prevents redundant analysis on rapid tab switches
- */
-const ANALYSIS_COOLDOWN_MS = 30000;
+const KNOWN_SAFE_DOMAINS = new Set([
+  'accounts.google.com',
+  'mail.google.com',
+  'google.com',
+  'www.google.com',
+  'paypal.com',
+  'www.paypal.com',
+  'account.paypal.com',
+  'signin.ebay.com',
+  'signin.amazon.com',
+  'amazon.com',
+  'www.amazon.com',
+  'microsoft.com',
+  'www.microsoft.com',
+  'login.live.com',
+  'apple.com',
+  'www.apple.com',
+  'iforgot.apple.com',
+  'github.com',
+  'www.github.com',
+  'login.github.com',
+  'facebook.com',
+  'www.facebook.com',
+  'messenger.com',
+  'www.messenger.com',
+  'netflix.com',
+  'www.netflix.com',
+  'spotify.com',
+  'www.spotify.com',
+  'dropbox.com',
+  'www.dropbox.com',
+  'outlook.live.com',
+  'mail.outlook.com',
+]);
 
 /**
  * Domain cache: stores analysis results per domain
@@ -56,40 +59,72 @@ interface CachedAnalysis {
 const analyzedDomains = new Map<string, CachedAnalysis>();
 const domainHasSensitiveForms = new Map<string, boolean>();
 
+export interface AnalysisDecision {
+  shouldAnalyze: boolean;
+  cachedResult?: CachedAnalysis;
+}
+
 /**
  * Check if a URL should be analyzed based on intelligent filtering
+ * Returns decision with cached result if available
+ * 
+ * Key principle: When a domain has been recently analyzed (within cooldown),
+ * we ALWAYS use the cached result for both risk level AND XP awarding.
+ * This prevents inconsistent behavior where some revisits award XP and others don't.
  */
-export async function shouldAnalyzeUrl(url: string): Promise<boolean> {
+export async function shouldAnalyzeUrl(url: string): Promise<AnalysisDecision> {
   // 0. Check whitelist first (user-trusted domains)
   if (await isWhitelisted(url)) {
-    return false;
+    return { shouldAnalyze: false };
   }
 
   // 1. Skip internal/safe URLs
   if (SKIP_LIST.some((skip) => url.startsWith(skip))) {
-    return false;
+    return { shouldAnalyze: false };
   }
 
   try {
     const parsed = new URL(url);
     const domain = parsed.hostname;
 
-    // 2. Check domain cache (skip if recently analyzed)
-    const cached = analyzedDomains.get(domain);
-    if (cached && Date.now() - cached.time < ANALYSIS_COOLDOWN_MS) {
-      return false;
+    // 1.5. Check known-safe domains - always mark as safe
+    if (KNOWN_SAFE_DOMAINS.has(domain)) {
+      return {
+        shouldAnalyze: false,
+        cachedResult: {
+          time: Date.now(),
+          level: 'safe',
+          patterns: ['known_safe_domain'],
+        },
+      };
     }
 
-    // 3. Check high-priority patterns (always analyze these when not in cooldown)
+    // 2. Check domain cache and cooldown FIRST
+    // This ensures consistent behavior: if recently analyzed, use cache
+    const cached = analyzedDomains.get(domain);
+    const inCooldown = cached && Date.now() - cached.time < TIMINGS.ANALYSIS_COOLDOWN_MS;
+
+    // If in cooldown period, ALWAYS use cached result (for consistent XP awarding)
+    if (inCooldown) {
+      return { shouldAnalyze: false, cachedResult: cached };
+    }
+
+    // 3. Check high-priority patterns (only when NOT in cooldown)
     const isHighPriority = HIGH_PRIORITY_PATTERNS.some((p) => p.test(url));
     if (isHighPriority) {
-      return true;
+      return { shouldAnalyze: true };
     }
 
     // 4. Analyze if domain has sensitive forms (from content script)
-    return domainHasSensitiveForms.get(domain) ?? false;
+    if (domainHasSensitiveForms.get(domain)) {
+      return { shouldAnalyze: true };
+    }
+
+    // 5. Default: don't re-analyze, but return cached result if available
+    return { shouldAnalyze: false, cachedResult: cached };
   } catch {
-    return false;
+    console.warn("[AnalysisStrategy] Failed to parse URL:", url);
+    return { shouldAnalyze: false };
   }
 }
 
@@ -108,8 +143,8 @@ export function markDomainAnalyzed(
       level,
       patterns,
     });
-  } catch {
-    // Invalid URL, skip caching
+  } catch (e) {
+    console.warn("[AnalysisStrategy] Failed to cache analysis for URL:", url, e);
   }
 }
 
@@ -120,7 +155,8 @@ export function getCachedAnalysis(url: string): CachedAnalysis | null {
   try {
     const domain = new URL(url).hostname;
     return analyzedDomains.get(domain) ?? null;
-  } catch {
+  } catch (e) {
+    console.warn("[AnalysisStrategy] Failed to get cached analysis for URL:", url, e);
     return null;
   }
 }

@@ -10,16 +10,8 @@ import {
   removeXp,
   awardBadge,
   xpProgressInLevel,
-  canAwardXp,
 } from "./storage";
 import { XP_REWARDS, STREAK_MILESTONES, LEVEL_TITLES } from "./constants";
-
-// Streak milestones: pages → badge id
-const STREAK_MILESTONES: Record<number, string> = {
-  10: "streak-starter",
-  25: "streak-veteran",
-  50: "streak-legend",
-};
 
 // --- Safe browsing XP + streak badges ---
 export async function awardSafeBrowsingXp(stats: UserStats): Promise<UserStats> {
@@ -89,6 +81,7 @@ export async function awardDangerAvoidedXp(stats: UserStats): Promise<UserStats>
 
 // --- Danger penalty (user loaded a dangerous page) ---
 export async function applyDangerPenalty(stats: UserStats): Promise<UserStats> {
+  // eslint-disable-next-line prefer-const -- Intentional: reassign then mutate for clarity
   let s = removeXp(stats, XP_REWARDS.DANGER_PENALTY);
   s.safeBrowsingStreak = 0;
   s.dangerSitesClicked = (s.dangerSitesClicked ?? 0) + 1;

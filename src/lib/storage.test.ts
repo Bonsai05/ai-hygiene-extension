@@ -9,9 +9,7 @@ import {
   xpForLevel,
   levelFromXp,
   maxXpForLevel,
-  type UserStats,
 } from "./storage";
-import { LEVEL_THRESHOLDS } from "./constants";
 
 // Mock chrome.storage
 const mockChromeStorage = {

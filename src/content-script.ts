@@ -2,6 +2,21 @@
 // Communicates with background service worker
 // Note: Self-contained — cannot import from lib/ (runs in page context)
 
+// Suspicious phrases for page content scanning
+const SUSPICIOUS_PHRASES = [
+  "verify your account",
+  "confirm your identity",
+  "update your information",
+  "suspend your account",
+  "unusual activity",
+  "verify your password",
+  "click here to verify",
+  "your account has been",
+  "confirm your account",
+  "security alert",
+  "urgent action required",
+];
+
 interface PageRiskSignals {
     hasLoginForm: boolean;
     formActionExternal: boolean;
@@ -43,7 +58,6 @@ function analyzePageContent(): PageRiskSignals {
         }
 
         // Check form action destinations
-        const currentHost = window.location.hostname;
         for (const form of forms) {
             const action = form.getAttribute("action") || "";
             if (action && !action.startsWith("/") && !action.startsWith(window.location.origin)) {
@@ -54,17 +68,8 @@ function analyzePageContent(): PageRiskSignals {
         }
 
         // Suspicious phrases
-        const suspiciousTextPatterns = [
-            "verify your account", "confirm your identity",
-            "update your information", "suspend your account",
-            "unusual activity", "verify your password",
-            "click here to verify", "your account has been",
-            "confirm your account", "security alert",
-            "urgent action required",
-        ];
-
         const bodyText = document.body?.innerText?.toLowerCase() || "";
-        for (const phrase of suspiciousTextPatterns) {
+        for (const phrase of SUSPICIOUS_PHRASES) {
             if (bodyText.includes(phrase)) {
                 signals.suspiciousPhrases.push(phrase);
             }
@@ -98,12 +103,17 @@ function sendPageSignals(signals: PageRiskSignals, url: string) {
             url,
             signals,
         });
-    } catch {
-        // Extension context may not be available
+    } catch (e) {
+        console.warn("[AI Hygiene] Failed to send page signals:", e);
     }
 }
 
 function scanPage() {
+    // Skip analysis for trivial/empty pages
+    if (document.body === null || document.body.children.length === 0) {
+        return;
+    }
+
     try {
         const signals = analyzePageContent();
         sendPageSignals(signals, window.location.href);

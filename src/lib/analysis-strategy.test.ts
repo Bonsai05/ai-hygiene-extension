@@ -15,36 +15,45 @@ import {
   getCacheStats,
 } from "./analysis-strategy";
 
+// Helper to extract boolean from AnalysisDecision
+interface AnalysisDecision {
+  shouldAnalyze: boolean;
+}
+
+const willAnalyze = (result: AnalysisDecision | boolean): boolean => {
+  return typeof result === 'object' ? result.shouldAnalyze : result;
+};
+
 describe("shouldAnalyzeUrl - Skip List", () => {
   beforeEach(() => {
     clearDomainCache();
   });
 
   it("skips chrome:// URLs", async () => {
-    expect(await shouldAnalyzeUrl("chrome://settings")).toBe(false);
-    expect(await shouldAnalyzeUrl("chrome://extensions")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("chrome://settings"))).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("chrome://extensions"))).toBe(false);
   });
 
   it("skips chrome-extension:// URLs", async () => {
-    expect(await shouldAnalyzeUrl("chrome-extension://abc123/popup.html")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("chrome-extension://abc123/popup.html"))).toBe(false);
   });
 
   it("skips about: URLs", async () => {
-    expect(await shouldAnalyzeUrl("about:blank")).toBe(false);
-    expect(await shouldAnalyzeUrl("about:newtab")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("about:blank"))).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("about:newtab"))).toBe(false);
   });
 
   it("skips localhost URLs", async () => {
-    expect(await shouldAnalyzeUrl("http://localhost:3000")).toBe(false);
-    expect(await shouldAnalyzeUrl("http://127.0.0.1:8080")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("http://localhost:3000"))).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("http://127.0.0.1:8080"))).toBe(false);
   });
 
   it("skips file:// URLs", async () => {
-    expect(await shouldAnalyzeUrl("file:///Users/test/file.html")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("file:///Users/test/file.html"))).toBe(false);
   });
 
   it("skips view-source: URLs", async () => {
-    expect(await shouldAnalyzeUrl("view-source:https://example.com")).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("view-source:https://example.com"))).toBe(false);
   });
 });
 
@@ -54,20 +63,22 @@ describe("shouldAnalyzeUrl - High Priority Patterns", () => {
   });
 
   it("always analyzes login pages", async () => {
-    expect(await shouldAnalyzeUrl("https://example.com/login")).toBe(true);
-    expect(await shouldAnalyzeUrl("https://example.com/signin")).toBe(true);
-    expect(await shouldAnalyzeUrl("https://example.com/auth/callback")).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://example.com/login"))).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://example.com/signin"))).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://example.com/auth/callback"))).toBe(true);
   });
 
   it("always analyzes banking/finance pages", async () => {
-    expect(await shouldAnalyzeUrl("https://bank.com/account")).toBe(true);
-    expect(await shouldAnalyzeUrl("https://paypal.com/checkout")).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://bank.com/account"))).toBe(true);
+    // paypal.com is in KNOWN_SAFE_DOMAINS, so it's marked safe without analysis
+    expect(willAnalyze(await shouldAnalyzeUrl("https://paypal.com/checkout"))).toBe(false);
   });
 
-  it("always analyzes brand login pages", async () => {
-    expect(await shouldAnalyzeUrl("https://google.com/signin")).toBe(true);
-    expect(await shouldAnalyzeUrl("https://microsoft.com/login")).toBe(true);
-    expect(await shouldAnalyzeUrl("https://github.com/auth")).toBe(true);
+  it("marks known safe brand domains as safe without analysis", async () => {
+    // These domains are in KNOWN_SAFE_DOMAINS
+    expect(willAnalyze(await shouldAnalyzeUrl("https://accounts.google.com"))).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://paypal.com"))).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://microsoft.com"))).toBe(false);
   });
 });
 
@@ -79,18 +90,18 @@ describe("shouldAnalyzeUrl - Domain Caching", () => {
   it("skips recently analyzed non-high-priority domains", async () => {
     const url = "https://example.com/page";  // Not high-priority
     markDomainAnalyzed(url, "safe", []);
-    expect(await shouldAnalyzeUrl(url)).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl(url))).toBe(false);
   });
 
   it("analyzes high-priority domains not in cache", async () => {
-    expect(await shouldAnalyzeUrl("https://new-domain.com/login")).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://new-domain.com/login"))).toBe(true);
   });
 
   it("respects cooldown for high-priority URLs when cached", async () => {
     const url = "https://example.com/login";  // High-priority
     markDomainAnalyzed(url, "safe", []);
     // High priority URLs should still respect cooldown
-    expect(await shouldAnalyzeUrl(url)).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl(url))).toBe(false);
   });
 });
 
@@ -120,14 +131,16 @@ describe("setDomainHasSensitiveForm", () => {
 
   it("marks domain as having sensitive forms", async () => {
     setDomainHasSensitiveForm("example.com", true);
-    expect(await shouldAnalyzeUrl("https://example.com/page")).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl("https://example.com/page"))).toBe(true);
   });
 
   it("allows domain without sensitive forms to be skipped", async () => {
     setDomainHasSensitiveForm("example.com", false);
     // Non-high-priority URL without sensitive forms should be skipped if cached
     markDomainAnalyzed("https://example.com/page", "safe", []);
-    expect(await shouldAnalyzeUrl("https://example.com/page")).toBe(false);
+    const result = await shouldAnalyzeUrl("https://example.com/page");
+    expect(result.shouldAnalyze).toBe(false);
+    expect(result.cachedResult?.level).toBe("safe");
   });
 });
 
@@ -169,13 +182,13 @@ describe("Analysis Cooldown", () => {
     markDomainAnalyzed(url, "safe", []);
 
     // Should be skipped (in cooldown)
-    expect(await shouldAnalyzeUrl(url)).toBe(false);
+    expect(willAnalyze(await shouldAnalyzeUrl(url))).toBe(false);
 
     // Manually expire the cache by marking with old timestamp
     // (In real usage, this happens automatically after 30s)
     clearDomainCache();
 
     // Should be analyzed again after cache cleared
-    expect(await shouldAnalyzeUrl(url)).toBe(true);
+    expect(willAnalyze(await shouldAnalyzeUrl(url))).toBe(true);
   });
 });
