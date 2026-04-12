@@ -31,10 +31,12 @@ export const STORAGE_KEYS = {
 // XP Rewards (single source of truth)
 // ---------------------------------------------------------------------------
 export const XP_REWARDS = {
-  SAFE_BROWSE: 5,
-  WARNING_IGNORED: 10,
-  DANGER_AVOIDED: 25,
-  DANGER_PENALTY: 15,
+  SAFE_BROWSE: 5,        // Safe page visit
+  WARNING_BROWSE: 10,    // Browsed a warning page without risky action (+10 XP)
+  WARNING_IGNORED: 10,   // Dismissed warning banner (same tier)
+  DANGER_AVOIDED: 25,    // Navigated away from danger page
+  DANGER_PENALTY: 15,    // Landed on a danger page
+  RISKY_ACTION_PENALTY: 15, // Performed risky action (download/mal-link) on a risky page
   SECURE_LOGIN: 10,
   PANIC_RECOVERY_COMPLETE: 30,
   PANIC_INITIATED: 5,
