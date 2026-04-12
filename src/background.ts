@@ -14,7 +14,6 @@ import {
   loadRiskLevel,
   saveRiskLevel,
   saveRiskEvent,
-  canAwardXp,
   type UserStats,
 } from "./lib/storage";
 import { analyzeUrl, contentRiskFromSignals, type RiskLevel } from "./lib/risk-detection";
@@ -43,25 +42,61 @@ import {
 // ---------------------------------------------------------------------------
 const VISITED_KEY = "visitedUrls";
 const DANGER_TABS_KEY = "dangerTabs";
+// Tracks URLs that already received XP this session (avoids double-awarding same URL)
+const XP_AWARDED_URLS_KEY = "xpAwardedUrls";
+// Tracks domains where ML analysis already ran (avoids re-running model on same domain)
+const ML_ANALYZED_DOMAINS_KEY = "mlAnalyzedDomains";
 
-// Track blob URLs per tab to prevent memory leaks
-const iconBlobUrls = new Map<number, string>();
+// Notification toast cooldown — only prevents toast spam, NOT XP awarding
+const SW_TOAST_COOLDOWN_KEY = "sw_last_toast_time";
+const TOAST_COOLDOWN_MS = 3_000; // 3 seconds between toasts so they don't pile up
 
-async function wasRecentlyVisited(url: string): Promise<boolean> {
-  const r = await chrome.storage.session.get([VISITED_KEY]);
-  return (r[VISITED_KEY] ?? []).includes(url);
+async function canShowToast(): Promise<boolean> {
+  const r = await chrome.storage.session.get([SW_TOAST_COOLDOWN_KEY]);
+  const last: number = r[SW_TOAST_COOLDOWN_KEY] ?? 0;
+  const now = Date.now();
+  if (now - last < TOAST_COOLDOWN_MS) return false;
+  await chrome.storage.session.set({ [SW_TOAST_COOLDOWN_KEY]: now });
+  return true;
 }
 
-async function markVisited(url: string): Promise<void> {
-  const r = await chrome.storage.session.get([VISITED_KEY]);
-  const list: string[] = r[VISITED_KEY] ?? [];
-  if (!list.includes(url)) {
-    await chrome.storage.session.set({ [VISITED_KEY]: [...list, url].slice(-300) });
+/** Returns true if this exact URL has never been awarded XP this session */
+async function hasXpBeenAwardedForUrl(url: string): Promise<boolean> {
+  const r = await chrome.storage.session.get([XP_AWARDED_URLS_KEY]);
+  const awarded: string[] = r[XP_AWARDED_URLS_KEY] ?? [];
+  return awarded.includes(url);
+}
+
+/** Mark a URL as XP-awarded so we don't double-award on refresh */
+async function markXpAwardedForUrl(url: string): Promise<void> {
+  const r = await chrome.storage.session.get([XP_AWARDED_URLS_KEY]);
+  const awarded: string[] = r[XP_AWARDED_URLS_KEY] ?? [];
+  if (!awarded.includes(url)) {
+    await chrome.storage.session.set({ [XP_AWARDED_URLS_KEY]: [...awarded, url].slice(-500) });
+  }
+}
+
+/** Returns true if this domain's ML analysis has already run this session */
+async function hasDomainBeenMLAnalyzed(domain: string): Promise<boolean> {
+  const r = await chrome.storage.session.get([ML_ANALYZED_DOMAINS_KEY]);
+  const analyzed: string[] = r[ML_ANALYZED_DOMAINS_KEY] ?? [];
+  return analyzed.includes(domain);
+}
+
+/** Mark domain as ML-analyzed */
+async function markDomainMLAnalyzed(domain: string): Promise<void> {
+  const r = await chrome.storage.session.get([ML_ANALYZED_DOMAINS_KEY]);
+  const analyzed: string[] = r[ML_ANALYZED_DOMAINS_KEY] ?? [];
+  if (!analyzed.includes(domain)) {
+    await chrome.storage.session.set({ [ML_ANALYZED_DOMAINS_KEY]: [...analyzed, domain].slice(-200) });
   }
 }
 
 async function clearVisited(): Promise<void> {
-  await chrome.storage.session.remove([VISITED_KEY, DANGER_TABS_KEY]);
+  await chrome.storage.session.remove([
+    VISITED_KEY, DANGER_TABS_KEY, XP_AWARDED_URLS_KEY,
+    ML_ANALYZED_DOMAINS_KEY, SW_TOAST_COOLDOWN_KEY,
+  ]);
 }
 
 async function markTabAsDanger(tabId: number, url: string): Promise<void> {
@@ -121,17 +156,27 @@ async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | nul
 // ---------------------------------------------------------------------------
 // Offscreen ML (Transformers.js WASM)
 // ---------------------------------------------------------------------------
+let creatingOffscreenPromise: Promise<void> | null = null;
+
+async function setupOffscreenDocument() {
+  const hasOffscreen = await chrome.offscreen.hasDocument();
+  if (hasOffscreen) return;
+  if (creatingOffscreenPromise) {
+    await creatingOffscreenPromise;
+    return;
+  }
+  creatingOffscreenPromise = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'ML inference with Transformers.js',
+  });
+  await creatingOffscreenPromise;
+  creatingOffscreenPromise = null;
+}
+
 async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult | null> {
   try {
-    // Ensure offscreen document exists
-    const hasOffscreen = await chrome.offscreen.hasDocument();
-    if (!hasOffscreen) {
-      await chrome.offscreen.createDocument({
-        url: 'offscreen.html',
-        reasons: ['WORKERS'],
-        justification: 'ML inference with Transformers.js',
-      });
-    }
+    await setupOffscreenDocument();
 
     const result = await chrome.runtime.sendMessage({
       type: 'analyzeUrl',
@@ -147,6 +192,7 @@ async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult |
     };
   } catch (err) {
     console.warn('[AI Hygiene] Offscreen ML failed:', err);
+    creatingOffscreenPromise = null;
     return null;
   }
 }
@@ -201,197 +247,256 @@ function notifyLevelUp(newLevel: number): void {
 // Passive Risk Indicators (toolbar badge + icon color)
 // ---------------------------------------------------------------------------
 function updateBrowserActionBadge(tabId: number, level: RiskLevel): void {
-  const badgeConfig: chrome.action.BadgeDetails = {
+  const textConfig: chrome.action.BadgeTextDetails = {
     text: level === "danger" ? "⚠️" : level === "warning" ? "!" : "",
-    color: level === "danger" ? "#ef4444" : level === "warning" ? "#f59e0b" : "#22c55e",
     tabId,
   };
-  chrome.action.setBadgeText(badgeConfig);
+  chrome.action.setBadgeText(textConfig);
   chrome.action.setBadgeBackgroundColor({
-    color: badgeConfig.color,
+    color: level === "danger" ? "#ef4444" : level === "warning" ? "#f59e0b" : "#22c55e",
     tabId,
   });
 }
 
 function updateToolbarIcon(tabId: number, level: RiskLevel): void {
-  // Track blob URLs per tab to prevent memory leaks
-  const prevUrl = iconBlobUrls.get(tabId);
-  if (prevUrl) URL.revokeObjectURL(prevUrl);
-
-  // Generate colored icon using canvas (no external files needed)
-  const colors: Record<RiskLevel, string> = {
-    safe: "#22c55e",
-    warning: "#f59e0b",
-    danger: "#ef4444",
+  // Service Workers do NOT have URL.createObjectURL.
+  // Use static icon paths bundled in public/icons/.
+  // The badge text + background color (set above) provides the visual state.
+  // We can still attempt to set a path-based icon if static files exist.
+  const iconMap: Record<RiskLevel, Record<string, string>> = {
+    safe:    { "16": "icons/icon16.png",  "48": "icons/icon48.png",  "128": "icons/icon128.png" },
+    warning: { "16": "icons/icon16.png",  "48": "icons/icon48.png",  "128": "icons/icon128.png" },
+    danger:  { "16": "icons/icon16.png",  "48": "icons/icon48.png",  "128": "icons/icon128.png" },
   };
-
-  // Create SVG icon with shield and status indicator
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
-      <circle cx="16" cy="16" r="14" fill="${colors[level]}" stroke="#1a1a1a" stroke-width="2"/>
-      <text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">
-        ${level === "danger" ? "⚠" : level === "warning" ? "!" : "✓"}
-      </text>
-    </svg>
-  `;
-  const svgBlob = new Blob([svg], { type: "image/svg+xml" });
-  const url = URL.createObjectURL(svgBlob);
-  iconBlobUrls.set(tabId, url);
-
-  chrome.action.setIcon({ path: url, tabId });
+  chrome.action.setIcon({ path: iconMap[level], tabId }).catch(() => {
+    // Silently fail — badge color already communicates state
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Banner injection
+// Banner injection — Shadow DOM so the host page cannot tamper with it
 // ---------------------------------------------------------------------------
 function injectWarningBanner(tabId: number, level: "warning" | "danger"): void {
   chrome.scripting.executeScript({
     target: { tabId },
     func: (riskLevel: string) => {
-      if (document.getElementById("ai-hygiene-warning-banner")) return;
-      const banner = document.createElement("div");
-      banner.id = "ai-hygiene-warning-banner";
-      Object.assign(banner.style, {
-        position: "fixed", top: "0", left: "0", width: "100%",
-        backgroundColor: riskLevel === "danger" ? "#ef4444" : "#f59e0b",
-        color: "white", padding: "16px", textAlign: "center",
-        fontFamily: "monospace", fontSize: "18px", fontWeight: "bold",
-        zIndex: "9999999", boxShadow: "0 4px 6px rgba(0,0,0,0.3)",
+      const BANNER_ID = "ai-hygiene-host";
+      if (document.getElementById(BANNER_ID)) return;
+
+      // Attach a Shadow DOM root to an invisible host element
+      const host = document.createElement("div");
+      host.id = BANNER_ID;
+      Object.assign(host.style, {
+        position: "fixed",
+        top: "0",
+        left: "0",
+        width: "100%",
+        zIndex: "2147483647",  // Max z-index
+        pointerEvents: "none", // host is invisible; shadow children get events
       });
-      banner.innerText = riskLevel === "danger"
-        ? "🚨 AI HYGIENE ALERT: This site has been flagged as a severe phishing risk!"
-        : "⚠️ AI HYGIENE WARNING: Proceed with caution. Do not share sensitive info here.";
-      document.body.prepend(banner);
+      document.documentElement.appendChild(host);
+
+      const shadow = host.attachShadow({ mode: "closed" });
+
+      const isDanger = riskLevel === "danger";
+      const bg = isDanger ? "#dc2626" : "#d97706";
+      const msg = isDanger
+        ? "🚨 DANGER: This site has been flagged as a phishing attack. Leave immediately."
+        : "⚠️ WARNING: Suspicious signals detected. Do not enter passwords or personal data.";
+
+      shadow.innerHTML = `
+        <div id="banner" style="
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          background: ${bg};
+          color: #ffffff;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
+          font-size: 14px;
+          font-weight: 700;
+          padding: 12px 20px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+          pointer-events: all;
+          box-sizing: border-box;
+          width: 100%;
+        ">
+          <span>${msg}</span>
+          <button id="dismiss" style="
+            background: rgba(255,255,255,0.2);
+            border: 2px solid rgba(255,255,255,0.6);
+            color: #ffffff;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 4px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            flex-shrink: 0;
+            margin-left: 12px;
+          ">Dismiss</button>
+        </div>
+      `;
+
+      shadow.getElementById("dismiss")?.addEventListener("click", () => {
+        host.remove();
+        // Notify extension that user dismissed the warning
+        try { (window as Window & typeof globalThis & { chrome?: typeof chrome }).chrome?.runtime?.sendMessage({ type: "dismissWarning" }); } catch {}
+      });
     },
     args: [level],
-  }).catch(err => console.error("[AI Hygiene] banner inject error:", err));
+  }).catch(() => {
+    // Silently fail — scripting may be blocked on certain pages (chrome://, etc.)
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Core analysis + XP awards
+// KEY DESIGN:
+//   XP awarding  = per unique URL (each YouTube short = new URL = new XP)
+//   ML analysis  = per domain    (youtube.com analyzed once, then cached)
 // ---------------------------------------------------------------------------
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (!url || !url.startsWith("http")) return;
 
-  // Intelligent analysis: skip internal URLs, use domain caching, check whitelist
-  const decision = await shouldAnalyzeUrl(url);
+  let domain = "";
+  try { domain = new URL(url).hostname; } catch { return; }
 
-  // Handle cached result - restore risk level and award XP for safe browsing
-  if (!decision.shouldAnalyze) {
-    const cached = decision.cachedResult || getCachedAnalysis(url);
-    if (cached) {
-      // Restore risk level from cache
-      if (tabId !== undefined) {
-        updateBrowserActionBadge(tabId, cached.level);
-        updateToolbarIcon(tabId, cached.level);
-      }
-      setRiskLevel(cached.level);
+  // Restore badge/icon state from domain cache immediately
+  const cached = getCachedAnalysis(url);
+  if (cached && tabId !== undefined) {
+    updateBrowserActionBadge(tabId, cached.level);
+    updateToolbarIcon(tabId, cached.level);
+    setRiskLevel(cached.level);
 
-      // Award XP for safe/warning cached pages (user is still browsing safely)
-      if (cached.level !== "danger") {
-        try {
-          const before = await loadStats();
+    // Award XP for this safe navigation if we haven't awarded for this exact URL yet
+    if (cached.level !== "danger") {
+      const alreadyAwarded = await hasXpBeenAwardedForUrl(url);
+      if (!alreadyAwarded) {
+        await markXpAwardedForUrl(url);
+        await updateStats(async (before) => {
           const after = await awardSafeBrowsingXp(before);
-          await saveStats(after);
-          await saveRiskEvent({
-            url,
-            riskLevel: cached.level,
-            detectedPatterns: cached.patterns,
-            timestamp: Date.now(),
-            xpChange: XP_REWARDS.SAFE_BROWSE,
-          });
-          if (canAwardXp()) {
-            await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing (cached)");
+          announceNewBadges(before, after);
+          if (after.level > before.level) notifyLevelUp(after.level);
+          const toastOk = await canShowToast();
+          if (toastOk) {
+            notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe visit — +5 XP! 🛡️").catch(() => {});
           }
-        } catch (e) {
-          console.error("[AI Hygiene] cached XP award error:", e);
-        }
+          return after;
+        });
+        await saveRiskEvent({
+          url,
+          riskLevel: cached.level,
+          detectedPatterns: cached.patterns,
+          timestamp: Date.now(),
+          xpChange: XP_REWARDS.SAFE_BROWSE,
+        });
       }
     }
     return;
   }
 
-  // Skip if already visited in this session
-  if (await wasRecentlyVisited(url)) return;
-  await markVisited(url);
+  // Check shouldAnalyzeUrl for ML-layer decisions (whitelist, skip list, etc.)
+  const decision = await shouldAnalyzeUrl(url);
+  if (!decision.shouldAnalyze && !cached) {
+    return; // Genuinely should not analyze (chrome://, localhost, etc.)
+  }
 
-  // Run all analyses in parallel — offscreen ML (WASM), backend ML (FastAPI), and heuristics
-  const [heuristic, offscreenML, backendML] = await Promise.all([
-    Promise.resolve(analyzeUrl(url)),
-    analyzeUrlWithOffscreenML().catch(() => null),  // On-device ML (WASM)
-    analyzeUrlWithBackend(url).catch(() => null),   // Optional FastAPI backend
-  ]);
+  // ML analysis — only run once per domain per session to avoid redundant compute
+  const domainAlreadyAnalyzed = await hasDomainBeenMLAnalyzed(domain);
 
-  // Determine final risk level: ML wins if available (offscreen preferred, then backend)
+  // Fetch settings to orchestrate model fallback appropriately
+  const resultObj = await chrome.storage.local.get(["backendSettings"]);
+  const backendConfig = resultObj.backendSettings ?? getDefaultBackendSettings();
+
+  // Run heuristics immediately (always, for every URL)
+  const heuristic = analyzeUrl(url);
   let finalLevel: "safe" | "warning" | "danger" = heuristic.level;
-  const mlResult = offscreenML || backendML;
+  let mlResult: BackendMLResult | null = null;
+
+  if (!domainAlreadyAnalyzed) {
+    // Waterfall priority: Backend NPU -> Local Browser ML -> Heuristics
+    if (backendConfig.useLocalBackend) {
+      mlResult = await analyzeUrlWithBackend(url).catch(() => null);
+    }
+    if (!mlResult && backendConfig.enabled) {
+      mlResult = await analyzeUrlWithOffscreenML(url).catch(() => null);
+    }
+    await markDomainMLAnalyzed(domain);
+  } else {
+    console.info(`[AI Hygiene] Skipping ML for ${domain} — already analyzed this session`);
+  }
 
   if (mlResult) {
     if (mlResult.level === "danger") {
       finalLevel = "danger";
     } else if (mlResult.level === "warning" && finalLevel !== "danger") {
       finalLevel = "warning";
+    } else if (mlResult.level === "safe" && finalLevel !== "danger") {
+      finalLevel = "safe";
     }
     console.info(`[AI Hygiene] ML:${mlResult.level}(${mlResult.score.toFixed(3)}) Heuristic:${heuristic.level} [${mlResult.provider}]`);
+  } else {
+    console.info(`[AI Hygiene] Heuristic only: ${heuristic.level}`);
   }
 
   // Cache the analysis result for this domain
   markDomainAnalyzed(url, finalLevel, heuristic.patterns);
 
-  // Notify popup of ML result
+  // Update popup with analysis result
   chrome.runtime.sendMessage({
     type: "mlRiskResult",
     level: finalLevel,
     mlScore: mlResult?.score ?? null,
-    modelVersion: mlResult?.provider ?? "Local CPU/Heuristic",
+    modelVersion: mlResult?.provider ?? "Heuristic",
   }).catch(() => {});
 
-  // Inject warning banner if needed
-  if (tabId !== undefined && (finalLevel === "danger" || finalLevel === "warning")) {
-    injectWarningBanner(tabId, finalLevel);
-  }
-
-  // Update passive indicators (toolbar badge + icon)
+  // Update badge and icon
   if (tabId !== undefined) {
     updateBrowserActionBadge(tabId, finalLevel);
     updateToolbarIcon(tabId, finalLevel);
+    if (finalLevel === "danger" || finalLevel === "warning") {
+      injectWarningBanner(tabId, finalLevel);
+    }
   }
 
   try {
-    const before = await loadStats();
-    let after: UserStats;
+    let finalXpChange = 0;
 
     if (finalLevel === "danger") {
+      // Always apply danger penalty — no rate limiting
       if (tabId !== undefined) await markTabAsDanger(tabId, url);
-      after = await applyDangerPenalty(before);
-      await saveStats(after);
-      await saveRiskEvent({ url, riskLevel: "danger", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: -XP_REWARDS.DANGER_PENALTY });
-
-      // Rate limit XP loss NOTIFICATIONS (still apply the penalty)
-      if (canAwardXp()) {
-        await notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
+      await updateStats(async (before) => {
+        const after = await applyDangerPenalty(before);
+        finalXpChange = -XP_REWARDS.DANGER_PENALTY;
+        notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Landed on a dangerous phishing site").catch(() => {});
+        announceNewBadges(before, after);
+        if (after.level > before.level) notifyLevelUp(after.level);
+        return after;
+      });
+    } else {
+      // Award XP for every unique URL visit on safe/warning pages
+      const alreadyAwarded = await hasXpBeenAwardedForUrl(url);
+      if (!alreadyAwarded) {
+        await markXpAwardedForUrl(url);
+        await updateStats(async (before) => {
+          const after = await awardSafeBrowsingXp(before);
+          finalXpChange = XP_REWARDS.SAFE_BROWSE;
+          announceNewBadges(before, after);
+          if (after.level > before.level) notifyLevelUp(after.level);
+          const toastOk = await canShowToast();
+          if (toastOk) {
+            const msg = finalLevel === "warning"
+              ? "Browsed carefully through a risky page — +5 XP"
+              : "Safe visit — +5 XP! 🛡️";
+            notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, msg).catch(() => {});
+          }
+          return after;
+        });
       }
-      setRiskLevel("danger");
-      return;
     }
 
-    // Always award XP for safe/warning pages
-    after = await awardSafeBrowsingXp(before);
-    await saveStats(after);
-    await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
-
-    // Rate limit XP gain NOTIFICATIONS (still award the XP)
-    if (canAwardXp()) {
-      if (finalLevel === "warning") {
-        await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
-      } else if (finalLevel === "safe") {
-        await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
-      }
-    }
-
-    announceNewBadges(before, after);
-    if (after.level > before.level) notifyLevelUp(after.level);
+    await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: finalXpChange });
     setRiskLevel(finalLevel);
+
   } catch (e) {
     console.error("[AI Hygiene] analyzeAndAward error:", e);
     setRiskLevel("safe");
@@ -475,30 +580,47 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, _sender,
   if (message.type === "pageScanResult") {
     const { url, signals } = message;
 
-    // Inform analysis strategy about sensitive forms for future analysis decisions
     try {
       const domain = new URL(url).hostname;
       setDomainHasSensitiveForm(domain, signals.hasPasswordField || signals.hasLoginForm);
     } catch {
-      // URL parsing failed, skip sensitive form tracking
+      // Skip tracking if parsing fails
     }
 
     const urlAnalysis = analyzeUrl(url);
-    const { level } = contentRiskFromSignals(signals, urlAnalysis);
+    const contentAnalysis = contentRiskFromSignals(signals, urlAnalysis);
+    const level = contentAnalysis.level;
+    const tabId = _sender.tab?.id;
 
-    // Wire up HTTPS login and HTTP password-field signals from content script
     if (signals.hasPasswordField) {
       if (signals.missingSecurityIndicators) {
-        // HTTP + password field — award password-pro badge
         updateStats(onPasswordFieldHttp).then(() => {});
       } else if (!signals.missingSecurityIndicators && url.startsWith("https://")) {
-        // HTTPS + password field — award secure login XP
         updateStats(onSecureLoginAttempt).then(() => {});
       }
     }
 
-    if (level === "danger") setRiskLevel("danger");
-    else if (level === "warning") setRiskLevel("warning");
+    if (level === "danger" || level === "warning") {
+      setRiskLevel(level);
+
+      if (tabId !== undefined) {
+        updateBrowserActionBadge(tabId, level);
+        updateToolbarIcon(tabId, level);
+        injectWarningBanner(tabId, level);
+      }
+
+      if (level === "danger") {
+        // Always penalise danger — no rate limiting here
+        updateStats(async (before) => {
+          if (tabId !== undefined) await markTabAsDanger(tabId, url);
+          const after = await applyDangerPenalty(before);
+          notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Page content flagged as dangerous").catch(() => {});
+          announceNewBadges(before, after);
+          return after;
+        }).then(() => {});
+      }
+    }
+    
     sendResponse({ received: true });
     return true;
   }

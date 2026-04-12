@@ -45,130 +45,49 @@ function containsBrandKeywords(hostname: string): boolean {
 // Re-export constants for use in other modules
 export { KNOWN_BRANDS, TYPOSQUAT_PATTERNS };
 
-/**
- * Analyze URL with weighted scoring system
- */
 export function analyzeUrl(url: string): RiskAnalysis {
     const patterns: string[] = [];
-    let score = 0;
-    let contextMultiplier = 1.0;
 
     try {
         const parsed = new URL(url);
         const hostname = parsed.hostname;
 
-        // --- CRITICAL SIGNALS ---
+        // --- CRITICAL SIGNALS (Immediate Danger) ---
+        if (detectTyposquatting(hostname)) patterns.push("typosquatting");
+        if (parsed.protocol === "data:") patterns.push("data_uri");
+        if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) patterns.push("ip_address_hostname");
+        if (url.includes("@")) patterns.push("url_with_at_symbol");
 
-        // Typosquatting (CRITICAL — never a false positive)
-        if (detectTyposquatting(hostname)) {
-            score += RISK_WEIGHTS.TYPOSQUAT;
-            patterns.push("typosquatting");
+        if (patterns.length > 0) {
+            return { level: "danger", score: 90, patterns, reason: "Critical phishing indicators detected in URL." };
         }
 
-        // Data URI (CRITICAL)
-        if (parsed.protocol === "data:") {
-            score += RISK_WEIGHTS.DATA_URI;
-            patterns.push("data_uri");
-        }
+        // --- WARNING SIGNALS ---
+        if (SUSPICIOUS_TLDS.some((t) => hostname.endsWith(t))) patterns.push("suspicious_tld");
+        if (parsed.protocol === "http:") patterns.push("http_protocol");
+        if (hostname.split(".").length > 4) patterns.push("excessive_subdomains");
+        if (url.length > 200) patterns.push("long_url");
 
-        // URL with @ symbol (credentials in URL — common phishing technique)
-        if (url.includes("@")) {
-            score += RISK_WEIGHTS.URL_WITH_AT;
-            patterns.push("url_with_at_symbol");
-        }
-
-        // --- HIGH SIGNALS ---
-
-        // IP address hostname (HIGH — rare for legitimate sites)
-        if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) {
-            score += RISK_WEIGHTS.IP_HOSTNAME;
-            patterns.push("ip_address_hostname");
-        }
-
-        // --- MEDIUM SIGNALS ---
-
-        // Suspicious TLD - using constant from constants.ts
-        if (SUSPICIOUS_TLDS.some((t) => hostname.endsWith(t))) {
-            score += RISK_WEIGHTS.SUSPICIOUS_TLD;
-            patterns.push("suspicious_tld");
-        }
-
-        // HTTP protocol (MEDIUM — but very common)
-        if (parsed.protocol === "http:") {
-            score += RISK_WEIGHTS.HTTP_PROTOCOL;
-            patterns.push("http_protocol");
-        }
-
-        // Excessive subdomains (>4)
-        if (hostname.split(".").length > 4) {
-            score += RISK_WEIGHTS.EXCESSIVE_SUBDOMAINS;
-            patterns.push("excessive_subdomains");
-        }
-
-        // Redirect parameters
         if (
             parsed.searchParams.has("redirect") ||
             parsed.searchParams.has("url") ||
             parsed.searchParams.has("continue") ||
             parsed.searchParams.has("return")
         ) {
-            score += RISK_WEIGHTS.REDIRECT_PARAM;
             patterns.push("redirect_param");
         }
 
-        // --- LOW SIGNALS ---
-
-        // Very long URL (>200 chars)
-        if (url.length > 200) {
-            score += RISK_WEIGHTS.LONG_URL;
-            patterns.push("long_url");
+        // Context check: If it contains a known trusted brand keyword and didn't trigger critical signs above, 
+        // we can safely assume it's legitimate (e.g. accounts.google.com).
+        if (containsBrandKeywords(hostname)) {
+            return { level: "safe", score: 10, patterns: [], reason: "Known trusted brand detected." };
         }
 
-        // Brand keywords in suspicious path context - removed to avoid false positives
-        // Legitimate brand login pages (e.g., accounts.google.com/signin) should not be flagged
-        // Typosquatting attempts are already caught by detectTyposquatting()
-
-        // --- CONTEXT MODIFIERS ---
-        // NOTE: Brand modifier only applies to NON-CRITICAL signals.
-        // Typoquatting, password-on-HTTP, and data URI are ALWAYS dangerous.
-
-        const hasCriticalSignal = patterns.some(p =>
-            ['typosquatting', 'password_field_http', 'data_uri'].includes(p)
-        );
-
-        // Only apply brand reduction for legitimate sites (without critical signals)
-        if (containsBrandKeywords(hostname) && !hasCriticalSignal) {
-            contextMultiplier *= CONTEXT_MODIFIERS.KNOWN_BRAND;
+        if (patterns.length >= 2) {
+            return { level: "warning", score: 50, patterns, reason: "Multiple suspicious patterns detected in URL." };
         }
 
-        if (patterns.length >= 3) {
-            contextMultiplier *= CONTEXT_MODIFIERS.MULTIPLE_SIGNALS;
-        }
-
-        // Apply context multiplier
-        score = Math.round(score * contextMultiplier);
-
-        // --- LEVEL DETERMINATION (with hysteresis) ---
-        // Using higher thresholds to reduce false positives
-
-        let level: RiskLevel = "safe";
-        let reason: string;
-
-        if (score >= RISK_THRESHOLDS.DANGER) {
-            level = "danger";
-            reason = "High-risk phishing indicators detected.";
-        } else if (score >= RISK_THRESHOLDS.WARNING) {
-            level = "warning";
-            reason = "Some suspicious patterns found. Proceed with caution.";
-        } else if (score >= RISK_THRESHOLDS.MINOR) {
-            level = "safe";
-            reason = "Minor concerns detected, but likely safe.";
-        } else {
-            level = "safe";
-            reason = "No significant risks detected.";
-        }
-
-        return { level, score, patterns, reason };
+        return { level: "safe", score: 0, patterns: [], reason: "No significant risks detected in URL." };
     } catch {
         return { level: "safe", score: 0, patterns: [], reason: "Could not parse URL." };
     }
@@ -271,7 +190,7 @@ export function analyzePageContent(): PageRiskSignals {
 }
 
 // --- Content script risk scoring ---
-// NOTE: XP is awarded in background.ts via awardSafeBrowsingXp(), not here.
+// NOTE: XP is awarded in background.ts via gamification logic.
 // This function only determines risk level and patterns.
 export function contentRiskFromSignals(
     signals: PageRiskSignals,
@@ -280,46 +199,39 @@ export function contentRiskFromSignals(
     level: RiskLevel;
     patterns: string[];
 } {
-    let score = urlAnalysis.score;
+    let level = urlAnalysis.level;
     const patterns = [...urlAnalysis.patterns];
+
+    if (level === "danger") return { level, patterns };
 
     // Password field on non-HTTPS (CRITICAL)
     if (signals.hasPasswordField && !window.location.protocol.startsWith("https:")) {
         patterns.push("password_field_http");
-        score += RISK_WEIGHTS.PASSWORD_ON_HTTP;
+        return { level: "danger", patterns };
     }
 
     // Password field with external form action (HIGH)
     if (signals.hasPasswordField && signals.formActionExternal) {
         patterns.push("password_field_external_submit");
-        score += RISK_WEIGHTS.EXTERNAL_FORM_ACTION;
+        return { level: "danger", patterns };
     }
 
     // Multiple suspicious phrases (HIGH)
     if (signals.suspiciousPhrases.length >= 3) {
         patterns.push("urgency_language_detected");
-        score += RISK_WEIGHTS.URGENT_LANGUAGE_3_PLUS;
+        if (level === "safe") level = "warning";
     }
 
     // Login form with urgency phrases (MEDIUM)
     if (signals.hasLoginForm && signals.suspiciousPhrases.length >= 2) {
         patterns.push("phishing_page_characteristics");
-        score += 25;
+        if (level === "safe") level = "warning";
     }
 
     // Iframe embedding on login pages (LOW)
     if (signals.hasLoginForm && signals.hasIframeEmbed) {
         patterns.push("login_page_with_iframe");
-        score += 20;
-    }
-
-    // Level determination (aligned with URL analysis thresholds)
-    let level: RiskLevel = "safe";
-
-    if (score >= RISK_THRESHOLDS.DANGER) {
-        level = "danger";
-    } else if (score >= RISK_THRESHOLDS.WARNING) {
-        level = "warning";
+        if (level === "safe") level = "warning";
     }
 
     return { level, patterns };

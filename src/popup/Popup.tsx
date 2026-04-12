@@ -154,13 +154,6 @@ export default function Popup() {
         </div>
       </div>
 
-      {/* Footer */}
-      <div className="bg-background border-t-2 border-border p-2">
-        <button className="w-full flex justify-center items-center gap-2 hover:bg-accent transition-colors py-2 text-xs font-mono">
-          <span> </span> Browser Extension Popup 🔌
-        </button>
-      </div>
-
       {/* XP gain / loss toast */}
       {xpToast && (
         <div className={`absolute top-16 right-4 left-4 border-2 border-border p-3 z-40

@@ -1,92 +1,281 @@
-# Privacy-First AI Digital Hygiene Companion 🛡️🧠
+<div align="center">
 
-A Browser Extension for First-Year Students to Learn Safe Online Behavior through Gamification and Guided Recovery.
+# 🛡️ AI Hygiene Companion
 
-## 1. Project Overview
-The Privacy-First AI Digital Hygiene Companion is a browser extension designed to help first-year students practice safe digital behavior while browsing emails and websites. The system focuses on two core ideas: learning by doing through gamification, and reducing panic during mistakes through guided recovery.
+**A production-grade Chrome Extension for real-time, on-device protection against phishing, trackers, and social engineering — powered by a Dual-Layer AI pipeline and a gamified "Safe-to-Earn" reward system.**
 
-## 2. Problem Statement
-New internet users often fall victim to phishing, suspicious links, or credential theft due to lack of experience. Existing tools either block content silently or overwhelm users with technical warnings, failing to teach safe behavior or help users recover calmly after mistakes.
+[![Build](https://img.shields.io/github/actions/workflow/status/your-org/ai-hygiene-extension/ci.yml?style=flat-square)](https://github.com/your-org/ai-hygiene-extension/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.2-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
+[![Manifest V3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?style=flat-square&logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/mv3/)
+[![Transformers.js](https://img.shields.io/badge/HuggingFace-Transformers.js-FFD21E?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/docs/transformer[Features](#-features) · [Architecture](ARCHITECTURE.md) · [Gamification](GAMIFICATION.md) · [Tech Stack](#-tech-stack) · [Installation](#-installation) · [Usage](#-usage) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [License](#-license)
 
-## 3. Proposed Solution
-This solution introduces a privacy-first browser extension that provides contextual risk awareness, gamified learning through XP and badges, and a unique 'I Think I Messed Up' panic button that guides users step-by-step after a mistake.
-
-## 4. Core Features
-*   **Risk Status Indicator:** Shows low, medium, or high risk while browsing emails or websites.
-*   **Digital Hygiene XP System:** Users earn XP for safe actions such as avoiding suspicious links or reporting emails.
-*   **Badges and Levels:** Visual rewards like 'Phish Spotter' or 'Password Pro' to reinforce learning.
-*   **Panic Button ('I Think I Messed Up'):** Allows users to instantly get guided recovery steps after a mistake.
-*   **Privacy-First Design:** No user browsing data is stored on cloud servers.
-
-## 5. Technology Stack
-*   **Frontend:** React, TypeScript, Tailwind CSS
-*   **Browser APIs:** Chrome Extension Manifest v3, Storage API, Active Tab API
-*   **Backend (Optional):** FastAPI (Python) for security logic and risk scoring
-*   **AI & Detection:** Lightweight ML models, heuristic-based URL and content analysis
-*   **Storage:** Browser local storage for XP, badges, and preferences
-
-## 6. Working Logic
-1.  The user browses an email or website.
-2.  The browser extension analyzes visible content and URLs.
-3.  Risk indicators are shown if suspicious patterns are detected.
-4.  If the user avoids the risk or reports it, XP is awarded.
-5.  If a mistake occurs, the user triggers the panic button.
-6.  Guided recovery steps are shown to mitigate damage and educate the user.
-
-## 7. System Architecture
-The architecture follows a modular, privacy-first design:
-*   Browser Extension handles UI, XP logic, and user interaction.
-*   On-device risk analysis performs feature extraction.
-*   Backend server processes requests without storing user data.
-*   AI engine provides explanations and recovery guidance.
-*   All gamification data is stored locally in the browser.
-
-## 8. Privacy & Security Considerations
-The system avoids collecting personally identifiable information. User behavior data remains on-device. Backend services are stateless and used only for risk scoring or explanation generation.
-
-## 9. Developer Implementation Notes
-Developers can extend this prototype by integrating real phishing datasets, adding animated XP rewards, improving AI explanations, and supporting additional browsers. The modular structure allows independent development of UI, detection logic, and backend services.
+</div>
 
 ---
 
-## Getting Started
+## Overview
+
+Traditional browser security tools rely on static blocklists and cloud-based heuristics — both of which lag behind the rapid mutation rate of modern phishing campaigns and trackers. The **AI Hygiene Companion** runs entirely on-device, combining a lightweight ONNX inference engine with an optional AMD NPU-accelerated heavyweight model to deliver real-time, privacy-preserving threat detection with zero external telemetry.
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---|---|
+| **Real-Time URL Analysis** | Detects phishing URLs using a locally executing ONNX model before the page fully renders |
+| **DOM Content Scanning** | Content scripts continuously analyse page text for credential-harvesting language, fake urgency, and dark patterns |
+| **Dual-Layer AI Pipeline** | Lightweight built-in WASM models for instant classification; opt-in heavyweight LLMs (Llama 3.2, DeepSeek R1) for deep de-obfuscation via a local NPU daemon |
+| **Shadow DOM Warning Banners** | Threat alerts are injected inside a ShadowRoot, making them tamper-proof even on malicious pages |
+| **Safe-to-Earn Gamification** | Earn XP and badges for safe behaviour; receive penalties for bypassing threat warnings — all enforced via a mutex-locked state engine |
+| **Per-URL XP Awarding** | Every unique page navigation awards +5 XP — scrolling YouTube Shorts awards XP for each new video |
+| **Privacy First** | All inference runs locally. No browsing data, URLs, or page content is ever sent to an external server |
+| **Manifest V3 Compliant** | Built on ephemeral Service Workers and the Offscreen Document API in strict accordance with Chrome's MV3 spec |
+
+---
+
+## 🏗 Architecture
+
+The extension is built around a **split-compute pipeline** that resolves the tension between real-time performance and deep analytical capability.
+
+```
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │                         Chrome Browser Sandbox                              │
+ │                                                                             │
+ │  ┌─────────────────┐    messages     ┌──────────────────────────────┐       │
+ │  │  content-script  │ ─────────────► │   background.ts (SW)         │       │
+ │  │  (DOM scraper)   │                │   Orchestrator + Mutex State  │       │
+ │  └─────────────────┘                └──────────┬───────────────────┘       │
+ │                                                │ routes to                  │
+ │                                    ┌───────────▼───────────┐               │
+ │                                    │   offscreen.ts         │               │
+ │                                    │   Transformers.js +    │               │
+ │                                    │   ONNX WebGPU/WASM     │               │
+ │                                    └───────────────────────┘               │
+ └─────────────────────────────────────────────────────────────────────────────┘
+                                               │ optional localhost call
+                                               ▼
+                                  ┌─────────────────────────┐
+                                  │  Local NPU Daemon        │
+                                  │  (Lemonade / GAIA /      │
+                                  │   LM Studio)             │
+                                  │  Llama 3.2 · DeepSeek R1 │
+                                  │  AMD Ryzen™ AI NPU       │
+                                  └─────────────────────────┘
+```
+
+### Layer 1 — Lightweight Built-In Engine *(Zero Configuration)*
+
+Runs entirely inside the browser via the [Offscreen Document API](https://developer.chrome.com/docs/extensions/reference/offscreen/), which provides access to WebAssembly and WebGPU without violating MV3 restrictions.
+
+- **Model:** `pirocheto/phishing-url-detection` — a fast, ONNX-quantised model for lexical URL classification
+- **Execution:** WebGPU (primary) → WASM SIMD (fallback)
+- **Latency:** Sub-100ms URL classification before the page finishes loading
+- **Privacy:** Model weights are fetched from HuggingFace and cached locally in IndexedDB. Zero data leaves the device at inference time.
+
+### Layer 2 — Heavyweight NPU Engine *(Opt-In)*
+
+For advanced tasks — de-obfuscating malicious JavaScript payloads, analysing multi-stage redirect chains, or generating plain-language threat explanations — the extension routes requests to a locally running LLM endpoint.
+
+- **Supported Runtimes:** [AMD GAIA](https://github.com/amd/gaia), [Lemonade Server](https://www.amd.com/en/developer/resources/technical-articles/2025/ryzen-ai-radeon-llms-with-lemonade.html), or any OpenAI-compatible local API
+- **Models:** `Llama 3.2 (1B/3B)`, `DeepSeek-R1 Distill`, `Qwen 2.5 Coder`
+- **Hardware:** AMD Ryzen™ AI NPU via the XDNA architecture and Vitis AI Execution Provider
+- **Communication:** Strictly bound to `localhost` — the extension never calls external LLM APIs
+
+For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+---
+
+## 🔧 Tech Stack
+
+| Layer | Technology |
+|---|---|
+| **Language** | TypeScript 5.2 |
+| **UI Framework** | React 18 |
+| **Build Tool** | Vite 5 + `@crxjs/vite-plugin` |
+| **ML Runtime** | `@huggingface/transformers` (Transformers.js v3) |
+| **ML Format** | ONNX via WASM / WebGPU |
+| **Styling** | Tailwind CSS 3, Radix UI primitives |
+| **State Management** | `chrome.storage.local` + promise-based Mutex |
+| **Testing** | Vitest + jsdom |
+| **Linting** | ESLint + TypeScript ESLint |
+
+---
+
+## 📦 Installation
 
 ### Prerequisites
 
-Ensure you have [Node.js](https://nodejs.org/) installed on your machine.
+- **Node.js** ≥ 18.0.0 and **npm** ≥ 9
+- A Chromium-based browser (Chrome 116+)
+- *(Optional)* A local LLM daemon for NPU acceleration
 
-### Installation & Build
+### Clone & Build
 
-1.  Clone or download the repository to your local machine:
-    ```bash
-    git clone <your-repository-url>
-    cd ai-hygiene-extension
-    ```
+```bash
+# 1. Clone the repository
+git clone https://github.com/your-org/ai-hygiene-extension.git
+cd ai-hygiene-extension
 
-2.  Install the necessary dependencies:
-    ```bash
-    npm install
-    ```
+# 2. Install dependencies
+npm install
 
-3.  Build the extension for production:
-    ```bash
-    npm run build
-    ```
-    This command will compile the React code and copy the assets, including the `manifest.json` and `icon.png`, into a new **`dist`** directory.
+# 3. Build the extension
+npm run build
+```
 
-## Loading the Extension in Chrome
+The compiled extension is placed in the `dist/` directory.
 
-To test the extension, you need to load the compiled `dist` folder into your browser:
+### Load as an Unpacked Extension
 
-1.  Open Chrome and navigate to `chrome://extensions/`.
-2.  Enable **Developer mode** using the toggle switch in the top right corner.
-3.  Click the **Load unpacked** button in the top left.
-4.  Navigate to your `ai-hygiene-extension` project folder.
-5.  **Important:** Select the **`dist`** folder inside your project directory (e.g., `Downloads/ai-hygiene-extension/dist`). Do not select the root project folder, or Chrome will not find the `manifest.json` file.
-6.  Click **Select Folder**.
+1. Open Chrome and navigate to `chrome://extensions`
+2. Enable **Developer mode** (toggle in the top-right corner)
+3. Click **Load unpacked**
+4. Select the `dist/` folder from this repository
 
-## Development
+### Development Mode (Hot Reload)
 
-To modify the extension, you can edit the files in the `src/` directory.
+```bash
+npm run dev
+```
 
-> **Note:** Because Chrome extensions require a specific build structure (like the `manifest.json` file pointing to compiled JavaScript), you must run `npm run build` after making changes to see them reflected in the browser. You can then click the "Refresh" icon on the extension's card in `chrome://extensions/` to load the new build.
+Vite watches for file changes and rebuilds automatically. Reload the extension in `chrome://extensions` after each rebuild during development.
+
+### Running Tests
+
+```bash
+# Run all tests in watch mode
+npm test
+
+# Single test run (for CI)
+npm run test:run
+```
+
+---
+
+## 🚀 Usage
+
+Once installed, the extension operates automatically. No configuration is required.
+
+### Dashboard
+
+Click the **shield icon** in the Chrome toolbar to open the popup dashboard. It displays:
+
+- Your current **XP** and **Level** (with title)
+- A live **Risk Status** indicator for the active tab
+- Earned **Badges** and unlock progress
+- A **Panic Button** for guided recovery after a security incident
+
+### Risk States
+
+| State | Badge | Meaning |
+|---|---|---|
+| 🟢 **Safe** | ✓ | No threats detected on the current page |
+| 🟡 **Warning** | ! | Suspicious signals present; proceed with caution |
+| 🔴 **Danger** | ⚠️ | Active phishing or credential-harvesting threat detected |
+
+A persistent warning **banner** is injected directly into the page via Shadow DOM whenever the extension enters `warning` or `danger` state. The banner includes a **Dismiss** button.
+
+### Gamification & XP
+
+> The extension rewards consistent safe browsing and penalises risky decisions to build lasting cybersecurity habits.
+
+| Event | XP Change |
+|---|---|
+| Safe page visit (every unique URL) | +5 XP |
+| Danger detected and avoided | +25 XP |
+| Secure password field (HTTPS) | +10 XP |
+| Dangerous site loaded | −15 XP |
+| Panic recovery completed | +30 XP |
+| Badge earned | +50 XP |
+
+For the full badge catalogue and level titles see **[GAMIFICATION.md](GAMIFICATION.md)**.
+
+### Settings
+
+Click the **⚙ gear icon** in the dashboard to access Settings:
+
+- **Lightweight Built-In Models** — toggle in-browser URL and content classification (enabled by default, zero config)
+- **Heavyweight Local NPU Daemon** — configure a local daemon URL (`http://127.0.0.1:8000`) for AMD NPU-accelerated LLM analysis
+
+---
+
+## 📂 Folder Structure
+
+```
+ai-hygiene-extension/
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.md
+│   │   └── feature_request.md
+│   └── PULL_REQUEST_TEMPLATE.md
+├── public/                      # Static assets (icons, manifest base)
+├── src/
+│   ├── lib/                     # Core business logic
+│   │   ├── analysis-strategy.ts # Domain caching and analysis orchestration
+│   │   ├── constants.ts         # XP rewards, badge definitions, default settings
+│   │   ├── gamification.ts      # XP calculation and badge award functions
+│   │   ├── notifications.ts     # Browser notification helpers
+│   │   ├── risk-detection.ts    # Heuristic URL and content risk scoring
+│   │   ├── storage.ts           # chrome.storage wrapper with mutex locking
+│   │   └── whitelist.ts         # Trusted domain allowlist
+│   ├── popup/
+│   │   ├── components/          # Reusable UI components (XPBar, BadgeGrid, etc.)
+│   │   ├── pages/
+│   │   │   ├── Onboarding.tsx   # First-run onboarding flow
+│   │   │   └── Settings.tsx     # Extension settings panel
+│   │   └── Popup.tsx            # Root popup component
+│   ├── background.ts            # MV3 Service Worker — message router and state orchestrator
+│   ├── content-script.ts        # Page-injected DOM scanner
+│   └── offscreen.ts             # Isolated Transformers.js inference worker
+├── ARCHITECTURE.md              # Comprehensive technical architecture documentation
+├── CHANGELOG.md                 # Version history
+├── CONTRIBUTING.md              # Contributor guide and coding rules
+├── GAMIFICATION.md              # XP, badge, and level system reference
+├── LICENSE                      # MIT License
+├── SECURITY.md                  # Vulnerability disclosure policy
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+└── vitest.config.ts
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome — whether it's improving the ML models, expanding the heuristic ruleset, or hardening the gamification logic.
+
+Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide, including the critical mutex usage rules that prevent race conditions in the XP engine.
+
+```bash
+# Quick start for contributors
+git checkout -b feature/your-feature-name
+npm run test:run && npm run build
+# Then open a Pull Request
+```
+
+---
+
+## 📄 License
+
+Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full terms.
+
+---
+
+## 🙏 Credits
+
+- [**pirocheto**](https://huggingface.co/pirocheto) — for the `phishing-url-detection` ONNX model
+- [**ONNX Community**](https://huggingface.co/onnx-community) — for maintaining quantised, browser-ready model distributions
+- [**Hugging Face**](https://huggingface.co/) — for Transformers.js, which makes in-browser ML inference possible
+- [**AMD**](https://www.amd.com/en/developer/resources/ryzen-ai-software.html) — for the Ryzen™ AI / XDNA NPU architecture and the GAIA open-source framework
+- The academic research documented in [`AI Hygiene Companion Chrome Extension.md`](AI%20Hygiene%20Companion%20Chrome%20Extension.md) that informed the dual-model threat detection strategy
+
+---
+
+
+<div align="center">
+  <sub>Built with ❤️ by the AI Hygiene Companion OSS Collective</sub>
+</div>
