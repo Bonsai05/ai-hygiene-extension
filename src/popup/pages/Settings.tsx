@@ -138,74 +138,35 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-6 bg-[#f8f9fa]">
-        {/* AI Model Settings */}
-        <Section title="AI Model Settings">
+        {/* Built-in ML Settings */}
+        <Section title="Lightweight Built-In Models (Transformers.js)">
           <ToggleRow
-            label="Enable AI Analysis"
-            description="Use ML model to detect phishing sites (recommended)"
+            label="Enable In-Browser URL Lexical Analysis"
+            description="Uses pirocheto/phishing-url-detection WebAssembly completely natively. Zero config."
             checked={backend.enabled}
             onChange={(v) => setBackend((s) => ({ ...s, enabled: v }))}
           />
 
           <ToggleRow
-            label="AMD NPU Acceleration"
-            description="Use AMD Neural Processing Unit for faster inference"
-            checked={backend.useAmdNpu}
-            onChange={(v) => setBackend((s) => ({ ...s, useAmdNpu: v }))}
-            disabled={!backend.enabled}
-          />
-
-          {backend.useAmdNpu && (
-            <InfoBox variant="info" className="mt-2 text-xs">
-              <p className="font-semibold">NPU Requirements:</p>
-              <ul className="list-disc ml-4 mt-1 space-y-0.5">
-                <li>AMD Ryzen 7000 series or newer</li>
-                <li>AMD Threadripper 7000 series</li>
-                <li>AMD Adrenalin drivers 23.11.1+</li>
-                <li>DirectML backend installed</li>
-              </ul>
-            </InfoBox>
-          )}
-
-          <ToggleRow
-            label="Lazy Load Model"
-            description="Load ML model only when needed (faster startup)"
+            label="In-Browser Text Classification"
+            description="Downloads ONNX Community DistilBERT to check DOM text locally."
             checked={backend.mlModelLazyLoad}
             onChange={(v) => setBackend((s) => ({ ...s, mlModelLazyLoad: v }))}
           />
-
-          <div className="mt-3 flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Backend Status:</span>
-            <span
-              className={`text-xs font-medium px-2 py-0.5 rounded ${
-                backendStatus === "running"
-                  ? "bg-green-100 text-green-800"
-                  : backendStatus === "offline"
-                  ? "bg-red-100 text-red-800"
-                  : "bg-gray-100 text-gray-800"
-              }`}
-            >
-              {backendStatus === "running"
-                ? "● Running"
-                : backendStatus === "offline"
-                ? "● Offline"
-                : "● Checking..."}
-            </span>
-          </div>
         </Section>
 
-        {/* Backend Configuration */}
-        <Section title="Backend Configuration">
+        {/* Heavyweight Server Configuration */}
+        <Section title="Heavyweight Local NPU Daemon">
           <div className="space-y-3">
             <ToggleRow
-              label="Use Local Backend"
-              description="Connect to local ML backend for enhanced detection"
+              label="Enable Heavyweight AMD Ryzen AI Models"
+              description="Routes deep inspection to an external local API (Lemonade Server / Host Daemon) for Llama 3.2 or DeepSeek R1."
               checked={backend.useLocalBackend}
               onChange={(v) => setBackend((s) => ({ ...s, useLocalBackend: v }))}
             />
 
             <div>
-              <label className="text-sm font-medium text-foreground">Backend URL</label>
+              <label className="text-sm font-medium text-foreground">Local Host API URL (Lemonade / Companion App)</label>
               <input
                 type="text"
                 value={backend.backendUrl}
@@ -215,7 +176,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                     setUrlError(null);
                     setBackend((s) => ({ ...s, backendUrl: newUrl }));
                   } else {
-                    setUrlError("Only 127.0.0.1 or localhost allowed");
+                    setUrlError("Only 127.0.0.1 or localhost allowed for external daemons.");
                   }
                 }}
                 className={`mt-1 w-full px-3 py-2 border rounded-md text-sm bg-background ${
@@ -228,19 +189,39 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
             <div className="flex gap-2">
               <Button onClick={handleTestConnection} variant="secondary" size="sm">
-                Test Connection
-              </Button>
-              <Button onClick={handleStartBackend} variant="default" size="sm">
-                Start Backend
+                Test Connection to Local Daemon
               </Button>
             </div>
+            
+            <div className="mt-3 flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">Local Daemon Status:</span>
+              <span
+                className={`text-xs font-medium px-2 py-0.5 rounded ${
+                  backendStatus === "running"
+                    ? "bg-green-100 text-green-800"
+                    : backendStatus === "offline"
+                    ? "bg-red-100 text-red-800"
+                    : "bg-gray-100 text-gray-800"
+                }`}
+              >
+                {backendStatus === "running"
+                  ? "● Connected to NPU Daemon"
+                  : backendStatus === "offline"
+                  ? "● Daemon Offline"
+                  : "● Checking..."}
+              </span>
+            </div>
 
-            <ToggleRow
-              label="Auto-start Backend"
-              description="Start local backend automatically on browser launch"
-              checked={backend.autoStartBackend}
-              onChange={(v) => setBackend((s) => ({ ...s, autoStartBackend: v }))}
-            />
+            {backend.useLocalBackend && (
+              <InfoBox variant="info" className="mt-2 text-xs">
+                <p className="font-semibold">Hardware Acceleration Activated:</p>
+                <ul className="list-disc ml-4 mt-1 space-y-0.5">
+                  <li>Leveraging AMD Ryzen 7000+ Series NPU</li>
+                  <li>DirectML execution provider enabled</li>
+                  <li>Inference decoupled from Chrome Sandbox</li>
+                </ul>
+              </InfoBox>
+            )}
           </div>
         </Section>
 

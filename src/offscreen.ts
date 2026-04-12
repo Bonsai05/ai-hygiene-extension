@@ -7,10 +7,10 @@ import { pipeline, env, type Pipeline } from '@huggingface/transformers';
  * MV3 architecture: the service worker (background.ts) cannot load WASM directly,
  * so it delegates to this offscreen document which has full DOM and WASM support.
  *
- * Uses Xenova/phishing-url-detection — a lightweight DistilRoBERTa model specific for URLs.
+ * Uses pirocheto/phishing-url-detection — a lightweight ONNX model specific for URLs.
  */
 
-const MODEL_ID = 'Xenova/phishing-url-detection';
+const MODEL_ID = 'pirocheto/phishing-url-detection';
 
 type MLRiskLevel = 'safe' | 'warning' | 'danger';
 

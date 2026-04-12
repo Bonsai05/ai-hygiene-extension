@@ -156,33 +156,25 @@ export function getDefaultStats(): UserStats {
 // ---------------------------------------------------------------------------
 // Mutex queue for concurrent updates (prevents race conditions)
 // ---------------------------------------------------------------------------
-let statsLock = Promise.resolve();
-let lastXpAwardTime = 0;
+
+// The mutex holds the last settled UserStats so callers can chain correctly.
+let statsLockResult: Promise<UserStats> = Promise.resolve({} as UserStats);
 
 /**
- * Update stats with mutex protection - prevents race conditions when multiple
- * XP awards happen simultaneously (e.g., safe browsing + streak milestone)
+ * Update stats with mutex protection — prevents race conditions when multiple
+ * XP awards happen simultaneously (e.g., safe browsing + streak milestone).
+ * Returns the fully-updated UserStats so callers can use the fresh value.
  */
 export async function updateStats(
   updater: (stats: UserStats) => UserStats | Promise<UserStats>
 ): Promise<UserStats> {
-  statsLock = statsLock.then(async () => {
+  statsLockResult = statsLockResult.then(async () => {
     const current = await loadStats();
     const updated = await updater(current);
     await saveStats(updated);
     return updated;
   });
-  return statsLock;
-}
-
-/**
- * Check if XP can be awarded (rate limiting to prevent rapid-fire awards)
- */
-export function canAwardXp(): boolean {
-  const now = Date.now();
-  if (now - lastXpAwardTime < 5000) return false; // 5 second cooldown
-  lastXpAwardTime = now;
-  return true;
+  return statsLockResult;
 }
 
 /**
