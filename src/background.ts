@@ -20,6 +20,7 @@ import { analyzeUrl, contentRiskFromSignals, type RiskLevel } from "./lib/risk-d
 import {
   awardSafeBrowsingXp,
   applyDangerPenalty,
+  applyRiskyActionPenalty,
   onPanicButtonClicked,
   onRecoveryCompleted,
   onSecureLoginAttempt,
@@ -373,12 +374,13 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
       if (!alreadyAwarded) {
         await markXpAwardedForUrl(url);
         await updateStats(async (before) => {
-          const after = await awardSafeBrowsingXp(before);
+          const after = await awardSafeBrowsingXp(before, cached.level as "safe" | "warning");
           announceNewBadges(before, after);
           if (after.level > before.level) notifyLevelUp(after.level);
           const toastOk = await canShowToast();
           if (toastOk) {
-            notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe visit — +5 XP! 🛡️").catch(() => {});
+            const xpAmt = cached.level === "warning" ? XP_REWARDS.WARNING_BROWSE : XP_REWARDS.SAFE_BROWSE;
+            notifyXpGain(after, xpAmt, cached.level === "warning" ? "Careful browsing on risky page — +10 XP ⚠️" : "Safe visit — +5 XP! 🛡️").catch(() => {});
           }
           return after;
         });
@@ -478,16 +480,16 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
       if (!alreadyAwarded) {
         await markXpAwardedForUrl(url);
         await updateStats(async (before) => {
-          const after = await awardSafeBrowsingXp(before);
-          finalXpChange = XP_REWARDS.SAFE_BROWSE;
+          const after = await awardSafeBrowsingXp(before, finalLevel as "safe" | "warning");
+          finalXpChange = finalLevel === "warning" ? XP_REWARDS.WARNING_BROWSE : XP_REWARDS.SAFE_BROWSE;
           announceNewBadges(before, after);
           if (after.level > before.level) notifyLevelUp(after.level);
           const toastOk = await canShowToast();
           if (toastOk) {
             const msg = finalLevel === "warning"
-              ? "Browsed carefully through a risky page — +5 XP"
-              : "Safe visit — +5 XP! 🛡️";
-            notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, msg).catch(() => {});
+              ? `Browsed carefully through a risky page — +${XP_REWARDS.WARNING_BROWSE} XP ⚠️`
+              : `Safe visit — +${XP_REWARDS.SAFE_BROWSE} XP! 🛡️`;
+            notifyXpGain(after, finalXpChange, msg).catch(() => {});
           }
           return after;
         });
@@ -641,11 +643,29 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, _sender,
   }
   if (message.type === "dismissWarning") {
     loadStats().then(async (before) => {
-      const after = await awardSafeBrowsingXp(before);
+      const after = await awardSafeBrowsingXp(before, "warning");
       await saveStats(after);
       await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Continued with caution on a warning page");
       sendResponse({ stats: after });
     });
+    return true;
+  }
+
+  // Risky action detected on a risky page (download / malicious link click)
+  if (message.type === "riskyActionDetected") {
+    const { action, pageRiskLevel } = message as { action: string; pageRiskLevel: string };
+    // Only penalise if the page was already flagged as risky
+    if (pageRiskLevel === "warning" || pageRiskLevel === "danger") {
+      updateStats(async (before) => {
+        const after = await applyRiskyActionPenalty(before);
+        notifyXpLoss(after, XP_REWARDS.RISKY_ACTION_PENALTY,
+          `Risky action on flagged page: ${action} (-${XP_REWARDS.RISKY_ACTION_PENALTY} XP) 🚨`
+        ).catch(() => {});
+        announceNewBadges(before, after);
+        return after;
+      }).then(() => {});
+    }
+    sendResponse({ received: true });
     return true;
   }
 

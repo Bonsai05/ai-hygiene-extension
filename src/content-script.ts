@@ -127,3 +127,94 @@ if (document.readyState === "loading") {
 } else {
     setTimeout(scanPage, 500);
 }
+
+// ---------------------------------------------------------------------------
+// Risky action detection — only penalise when page is already flagged risky
+// ---------------------------------------------------------------------------
+
+// Executable / archive extensions that signal a potentially dangerous download
+const RISKY_EXTENSIONS = [
+    ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".dmg", ".pkg", ".apk",
+];
+
+function isRiskyDownloadLink(anchor: HTMLAnchorElement): boolean {
+    // Explicit download attribute always flagged
+    if (anchor.hasAttribute("download")) return true;
+    // Check href extension
+    try {
+        const href = anchor.href;
+        if (!href) return false;
+        const url = new URL(href);
+        const path = url.pathname.toLowerCase();
+        return RISKY_EXTENSIONS.some(ext => path.endsWith(ext));
+    } catch {
+        return false;
+    }
+}
+
+function isExternalLink(anchor: HTMLAnchorElement): boolean {
+    try {
+        const href = anchor.href;
+        if (!href) return false;
+        const linkHost = new URL(href).hostname;
+        const pageHost = window.location.hostname;
+        // Different host and not same-domain = external
+        return linkHost !== "" && linkHost !== pageHost;
+    } catch {
+        return false;
+    }
+}
+
+/** Current page risk level — fetched once from background on load */
+let currentPageRiskLevel: "safe" | "warning" | "danger" = "safe";
+
+function reportRiskyAction(action: string): void {
+    try {
+        chrome.runtime.sendMessage({
+            type: "riskyActionDetected",
+            action,
+            pageRiskLevel: currentPageRiskLevel,
+        });
+    } catch (e) {
+        console.warn("[AI Hygiene] Failed to report risky action:", e);
+    }
+}
+
+function initRiskyActionDetection(): void {
+    // Fetch the current risk level from background (non-blocking)
+    try {
+        chrome.runtime.sendMessage({ type: "getRiskLevel" }, (response) => {
+            if (response?.level) {
+                currentPageRiskLevel = response.level as "safe" | "warning" | "danger";
+            }
+        });
+    } catch {
+        // If the runtime is unavailable, fall back to "safe" (no penalty)
+    }
+
+    // Listen for clicks on the entire document and check the target anchor
+    document.addEventListener("click", (event: MouseEvent) => {
+        // Only apply penalties when on a risky page
+        if (currentPageRiskLevel === "safe") return;
+
+        const target = event.target as HTMLElement;
+        // Walk up the DOM tree to find the nearest anchor (handles clicks on child elements)
+        const anchor = target.closest("a") as HTMLAnchorElement | null;
+        if (!anchor) return;
+
+        if (isRiskyDownloadLink(anchor)) {
+            reportRiskyAction("file download on risky page");
+        } else if (isExternalLink(anchor)) {
+            reportRiskyAction("external link click on risky page");
+        }
+    }, { capture: true });
+}
+
+// Initialise risky action detection after a short delay to let the page settle
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(initRiskyActionDetection, 600));
+} else {
+    setTimeout(initRiskyActionDetection, 600);
+}

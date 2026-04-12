@@ -14,8 +14,13 @@ import {
 import { XP_REWARDS, STREAK_MILESTONES, LEVEL_TITLES } from "./constants";
 
 // --- Safe browsing XP + streak badges ---
-export async function awardSafeBrowsingXp(stats: UserStats): Promise<UserStats> {
-  let s = addXp(stats, XP_REWARDS.SAFE_BROWSE);
+export async function awardSafeBrowsingXp(
+  stats: UserStats,
+  riskLevel: "safe" | "warning" = "safe"
+): Promise<UserStats> {
+  // Award more XP for navigating a warning page carefully (more risk, more reward)
+  const xpAmount = riskLevel === "warning" ? XP_REWARDS.WARNING_BROWSE : XP_REWARDS.SAFE_BROWSE;
+  let s = addXp(stats, xpAmount);
   s.safeBrowsingStreak = (s.safeBrowsingStreak ?? 0) + 1;
   s.totalPagesAnalyzed = (s.totalPagesAnalyzed ?? 0) + 1;
 
@@ -77,6 +82,14 @@ export async function awardDangerAvoidedXp(stats: UserStats): Promise<UserStats>
   }
 
   return checkLevelUpBadge(s);
+}
+
+// --- Risky action penalty (download or malicious link click on a risky page) ---
+export async function applyRiskyActionPenalty(stats: UserStats): Promise<UserStats> {
+  let s = removeXp(stats, XP_REWARDS.RISKY_ACTION_PENALTY);
+  s.safeBrowsingStreak = 0;
+  s.dangerSitesClicked = (s.dangerSitesClicked ?? 0) + 1;
+  return s;
 }
 
 // --- Danger penalty (user loaded a dangerous page) ---
