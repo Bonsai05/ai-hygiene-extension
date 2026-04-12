@@ -40,11 +40,10 @@ describe("analyzeUrl - Danger URLs", () => {
   });
 
   it("detects typosquatting with brand + suspicious TLD as danger", () => {
-    // Typosquatting (65) + suspicious TLD (20) + HTTP (20) = 105 points (danger)
+    // Typosquatting (CRITICAL) = danger. We don't care about suspicious TLD since we return early.
     const result = analyzeUrl("http://amaz0n.tk/login");
     expect(result.level).toBe("danger");
     expect(result.patterns).toContain("typosquatting");
-    expect(result.patterns).toContain("suspicious_tld");
   });
 
   it("detects data: URI", () => {
@@ -61,24 +60,23 @@ describe("analyzeUrl - Danger URLs", () => {
 });
 
 describe("analyzeUrl - Warning URLs", () => {
-  it("identifies suspicious TLD without other indicators as warning", () => {
-    const result = analyzeUrl("http://example.tk/page");
-    // HTTP + suspicious TLD = 40 points, at/above warning threshold (35)
-    expect(result.level).toBe("warning");
-    expect(result.score).toBeGreaterThanOrEqual(35);
+  it("identifies suspicious TLD without other indicators as safe initially", () => {
+    // Only 1 warning sign is safe, 2 makes it warning
+    const result = analyzeUrl("https://example.tk");
+    expect(result.level).toBe("safe");
   });
 
-  it("identifies HTTP protocol as safe (low score)", () => {
+  it("identifies HTTP protocol alone as safe", () => {
     const result = analyzeUrl("http://example.com/page");
-    // HTTP protocol alone scores 20, below warning threshold (35)
     expect(result.level).toBe("safe");
-    expect(result.score).toBe(20);
+    expect(result.score).toBe(0);
   });
 
   it("identifies multiple signals as warning", () => {
-    // HTTP + suspicious TLD = 40 points, above warning threshold (35)
+    // HTTP + suspicious TLD = 2 signals = warning
     const result = analyzeUrl("http://example.tk/page");
-    expect(result.score).toBeGreaterThanOrEqual(35);
+    expect(result.level).toBe("warning");
+    expect(result.score).toBe(50);
   });
 });
 
@@ -159,6 +157,11 @@ describe("contentRiskFromSignals", () => {
   });
 
   it("upgrades to danger for password field with external form action", () => {
+    Object.defineProperty(window, "location", {
+      value: { protocol: "https:", hostname: "example.com" },
+      writable: true,
+    });
+    
     const signals: PageRiskSignals = {
       hasLoginForm: true,
       formActionExternal: true,
@@ -188,8 +191,8 @@ describe("contentRiskFromSignals", () => {
       missingSecurityIndicators: false,
     };
     const result = contentRiskFromSignals(signals, baseUrlAnalysis);
-    // 30 points from urgency language (below warning threshold of 35)
     expect(result.patterns).toContain("urgency_language_detected");
+    expect(result.level).toBe("warning");
   });
 
   it("upgrades to warning for 3+ phrases with login form", () => {
@@ -205,7 +208,6 @@ describe("contentRiskFromSignals", () => {
       missingSecurityIndicators: false,
     };
     const result = contentRiskFromSignals(signals, baseUrlAnalysis);
-    // 30 (urgency) + 25 (login form with phrases) = 55 points (warning)
     expect(result.level).toBe("warning");
   });
 
@@ -228,29 +230,28 @@ describe("contentRiskFromSignals", () => {
 });
 
 describe("Score thresholds", () => {
-  it("danger threshold is score >= 65", () => {
+  it("danger threshold is score 90", () => {
     const result = analyzeUrl("http://g00gle.com");
     expect(result.level).toBe("danger");
-    expect(result.score).toBeGreaterThanOrEqual(65);
+    expect(result.score).toBe(90);
   });
 
-  it("warning threshold is score >= 35", () => {
-    // HTTP + suspicious TLD = 40 points (warning)
+  it("warning threshold is score 50", () => {
+    // HTTP + suspicious TLD = 2 warning signals -> 50
     const result = analyzeUrl("http://example.tk/page");
-    expect(result.score).toBeGreaterThanOrEqual(35);
+    expect(result.score).toBe(50);
     expect(result.level).toBe("warning");
   });
 
-  it("safe with minor concerns is score >= 15", () => {
-    // HTTP alone = 20 points (safe with minor concerns)
-    const result = analyzeUrl("http://example.com/page");
-    expect(result.score).toBeGreaterThanOrEqual(15);
+  it("known brands get 10", () => {
+    const result = analyzeUrl("https://accounts.google.com/signin");
+    expect(result.score).toBe(10);
     expect(result.level).toBe("safe");
   });
 
-  it("completely safe is score < 15", () => {
-    const result = analyzeUrl("https://google.com");
-    expect(result.score).toBeLessThan(15);
+  it("completely safe is score 0", () => {
+    const result = analyzeUrl("https://example.com");
+    expect(result.score).toBe(0);
     expect(result.level).toBe("safe");
   });
 });

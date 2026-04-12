@@ -121,17 +121,27 @@ async function analyzeUrlWithBackend(url: string): Promise<BackendMLResult | nul
 // ---------------------------------------------------------------------------
 // Offscreen ML (Transformers.js WASM)
 // ---------------------------------------------------------------------------
+let creatingOffscreenPromise: Promise<void> | null = null;
+
+async function setupOffscreenDocument() {
+  const hasOffscreen = await chrome.offscreen.hasDocument();
+  if (hasOffscreen) return;
+  if (creatingOffscreenPromise) {
+    await creatingOffscreenPromise;
+    return;
+  }
+  creatingOffscreenPromise = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'ML inference with Transformers.js',
+  });
+  await creatingOffscreenPromise;
+  creatingOffscreenPromise = null;
+}
+
 async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult | null> {
   try {
-    // Ensure offscreen document exists
-    const hasOffscreen = await chrome.offscreen.hasDocument();
-    if (!hasOffscreen) {
-      await chrome.offscreen.createDocument({
-        url: 'offscreen.html',
-        reasons: ['WORKERS'],
-        justification: 'ML inference with Transformers.js',
-      });
-    }
+    await setupOffscreenDocument();
 
     const result = await chrome.runtime.sendMessage({
       type: 'analyzeUrl',
@@ -147,6 +157,7 @@ async function analyzeUrlWithOffscreenML(url: string): Promise<BackendMLResult |
     };
   } catch (err) {
     console.warn('[AI Hygiene] Offscreen ML failed:', err);
+    creatingOffscreenPromise = null;
     return null;
   }
 }
@@ -280,19 +291,22 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (!decision.shouldAnalyze) {
     const cached = decision.cachedResult || getCachedAnalysis(url);
     if (cached) {
-      // Restore risk level from cache
       if (tabId !== undefined) {
         updateBrowserActionBadge(tabId, cached.level);
         updateToolbarIcon(tabId, cached.level);
       }
       setRiskLevel(cached.level);
 
-      // Award XP for safe/warning cached pages (user is still browsing safely)
+      // Mutex protected state update for cached XP
       if (cached.level !== "danger") {
         try {
-          const before = await loadStats();
-          const after = await awardSafeBrowsingXp(before);
-          await saveStats(after);
+          await updateStats(async (before) => {
+            const after = await awardSafeBrowsingXp(before);
+            if (canAwardXp()) {
+              await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing (cached)");
+            }
+            return after;
+          });
           await saveRiskEvent({
             url,
             riskLevel: cached.level,
@@ -300,9 +314,6 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
             timestamp: Date.now(),
             xpChange: XP_REWARDS.SAFE_BROWSE,
           });
-          if (canAwardXp()) {
-            await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing (cached)");
-          }
         } catch (e) {
           console.error("[AI Hygiene] cached XP award error:", e);
         }
@@ -315,24 +326,36 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   if (await wasRecentlyVisited(url)) return;
   await markVisited(url);
 
-  // Run all analyses in parallel — offscreen ML (WASM), backend ML (FastAPI), and heuristics
-  const [heuristic, offscreenML, backendML] = await Promise.all([
-    Promise.resolve(analyzeUrl(url)),
-    analyzeUrlWithOffscreenML().catch(() => null),  // On-device ML (WASM)
-    analyzeUrlWithBackend(url).catch(() => null),   // Optional FastAPI backend
-  ]);
+  // Fetch settings to orchestrate model fallback appropriately
+  const resultObj = await chrome.storage.local.get(["backendSettings"]);
+  const backendConfig = resultObj.backendSettings ?? getDefaultBackendSettings();
 
-  // Determine final risk level: ML wins if available (offscreen preferred, then backend)
+  // Run heuristics immediately
+  const heuristic = analyzeUrl(url);
   let finalLevel: "safe" | "warning" | "danger" = heuristic.level;
-  const mlResult = offscreenML || backendML;
+  let mlResult: BackendMLResult | null = null;
+
+  // Waterfall priority: Backend NPU -> Local Browser ML -> Heuristics
+  if (backendConfig.enabled) {
+    mlResult = await analyzeUrlWithBackend(url).catch(() => null);
+  }
+
+  if (!mlResult) {
+    mlResult = await analyzeUrlWithOffscreenML(url).catch(() => null);
+  }
 
   if (mlResult) {
     if (mlResult.level === "danger") {
       finalLevel = "danger";
     } else if (mlResult.level === "warning" && finalLevel !== "danger") {
       finalLevel = "warning";
+    } else if (mlResult.level === "safe" && finalLevel !== "danger") {
+      // Allow ML to override heuristic warnings if confident it's safe
+      finalLevel = "safe";
     }
     console.info(`[AI Hygiene] ML:${mlResult.level}(${mlResult.score.toFixed(3)}) Heuristic:${heuristic.level} [${mlResult.provider}]`);
+  } else {
+    console.info(`[AI Hygiene] Relied completely on Heuristic fallback: ${heuristic.level}`);
   }
 
   // Cache the analysis result for this domain
@@ -346,52 +369,53 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
     modelVersion: mlResult?.provider ?? "Local CPU/Heuristic",
   }).catch(() => {});
 
-  // Inject warning banner if needed
   if (tabId !== undefined && (finalLevel === "danger" || finalLevel === "warning")) {
     injectWarningBanner(tabId, finalLevel);
   }
 
-  // Update passive indicators (toolbar badge + icon)
   if (tabId !== undefined) {
     updateBrowserActionBadge(tabId, finalLevel);
     updateToolbarIcon(tabId, finalLevel);
   }
 
   try {
-    const before = await loadStats();
-    let after: UserStats;
+    let finalXpChange = 0;
+    
+    // Mutex protected state update
+    await updateStats(async (before) => {
+      let after: UserStats;
 
-    if (finalLevel === "danger") {
-      if (tabId !== undefined) await markTabAsDanger(tabId, url);
-      after = await applyDangerPenalty(before);
-      await saveStats(after);
-      await saveRiskEvent({ url, riskLevel: "danger", detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: -XP_REWARDS.DANGER_PENALTY });
+      if (finalLevel === "danger") {
+        if (tabId !== undefined) await markTabAsDanger(tabId, url);
+        after = await applyDangerPenalty(before);
+        finalXpChange = -XP_REWARDS.DANGER_PENALTY;
 
-      // Rate limit XP loss NOTIFICATIONS (still apply the penalty)
+        if (canAwardXp()) {
+          notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site").catch(()=>console.error);
+        }
+        return after;
+      }
+
+      // Always award XP for safe/warning pages
+      after = await awardSafeBrowsingXp(before);
+      finalXpChange = XP_REWARDS.SAFE_BROWSE;
+
       if (canAwardXp()) {
-        await notifyXpLoss(after, XP_REWARDS.DANGER_PENALTY, "Loaded a dangerous site");
+        if (finalLevel === "warning") {
+          notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page").catch(()=>console.error);
+        } else if (finalLevel === "safe") {
+          notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded").catch(()=>console.error);
+        }
       }
-      setRiskLevel("danger");
-      return;
-    }
 
-    // Always award XP for safe/warning pages
-    after = await awardSafeBrowsingXp(before);
-    await saveStats(after);
-    await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: XP_REWARDS.SAFE_BROWSE });
+      announceNewBadges(before, after);
+      if (after.level > before.level) notifyLevelUp(after.level);
+      return after;
+    });
 
-    // Rate limit XP gain NOTIFICATIONS (still award the XP)
-    if (canAwardXp()) {
-      if (finalLevel === "warning") {
-        await notifyXpGain(after, XP_REWARDS.WARNING_IGNORED, "Proceeded carefully on a risky page");
-      } else if (finalLevel === "safe") {
-        await notifyXpGain(after, XP_REWARDS.SAFE_BROWSE, "Safe browsing session recorded");
-      }
-    }
-
-    announceNewBadges(before, after);
-    if (after.level > before.level) notifyLevelUp(after.level);
+    await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: heuristic.patterns, timestamp: Date.now(), xpChange: finalXpChange });
     setRiskLevel(finalLevel);
+
   } catch (e) {
     console.error("[AI Hygiene] analyzeAndAward error:", e);
     setRiskLevel("safe");
