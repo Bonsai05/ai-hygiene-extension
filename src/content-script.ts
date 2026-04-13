@@ -1,8 +1,9 @@
-// Content script: Runs on page load to analyze page content for risk signals
-// Communicates with background service worker
-// Note: Self-contained — cannot import from lib/ (runs in page context)
+// content-script.ts
+// Runs in every page context. Self-contained — cannot import from lib/.
+// Analyzes page content and reports signals to background.
+// Also detects risky click actions (downloads / external links) on risky pages.
 
-// Suspicious phrases for page content scanning
+// ── Suspicious phrases for content scanning ───────────────────────────────
 const SUSPICIOUS_PHRASES = [
   "verify your account",
   "confirm your identity",
@@ -17,204 +18,148 @@ const SUSPICIOUS_PHRASES = [
   "urgent action required",
 ];
 
-interface PageRiskSignals {
-    hasLoginForm: boolean;
-    formActionExternal: boolean;
-    hasPasswordField: boolean;
-    hasEmailField: boolean;
-    externalFormAction: string | null;
-    hasObfuscatedText: boolean;
-    suspiciousPhrases: string[];
-    hasIframeEmbed: boolean;
-    missingSecurityIndicators: boolean;
-}
-
-function analyzePageContent(): PageRiskSignals {
-    const signals: PageRiskSignals = {
-        hasLoginForm: false,
-        formActionExternal: false,
-        hasPasswordField: false,
-        hasEmailField: false,
-        externalFormAction: null,
-        hasObfuscatedText: false,
-        suspiciousPhrases: [],
-        hasIframeEmbed: false,
-        missingSecurityIndicators: false,
-    };
-
-    try {
-        const forms = document.querySelectorAll("form");
-        const passwordInputs = document.querySelectorAll("input[type='password']");
-        const emailInputs = document.querySelectorAll("input[type='email'], input[name='email'], input[name='username']");
-
-        if (forms.length > 0 || passwordInputs.length > 0) {
-            signals.hasLoginForm = true;
-        }
-        if (passwordInputs.length > 0) {
-            signals.hasPasswordField = true;
-        }
-        if (emailInputs.length > 0) {
-            signals.hasEmailField = true;
-        }
-
-        // Check form action destinations
-        for (const form of forms) {
-            const action = form.getAttribute("action") || "";
-            if (action && !action.startsWith("/") && !action.startsWith(window.location.origin)) {
-                signals.formActionExternal = true;
-                signals.externalFormAction = action;
-                signals.suspiciousPhrases.push("Form submits to external domain");
-            }
-        }
-
-        // Suspicious phrases
-        const bodyText = document.body?.innerText?.toLowerCase() || "";
-        for (const phrase of SUSPICIOUS_PHRASES) {
-            if (bodyText.includes(phrase)) {
-                signals.suspiciousPhrases.push(phrase);
-            }
-        }
-
-        if (signals.suspiciousPhrases.length >= 3) {
-            signals.hasObfuscatedText = true;
-        }
-
-        // Iframes
-        if (document.querySelectorAll("iframe").length > 0) {
-            signals.hasIframeEmbed = true;
-        }
-
-        // HTTPS check
-        const isHttps = window.location.protocol === "https:";
-        if (signals.hasPasswordField && !isHttps) {
-            signals.missingSecurityIndicators = true;
-        }
-    } catch {
-        // Cross-origin restrictions may apply
-    }
-
-    return signals;
-}
-
-function sendPageSignals(signals: PageRiskSignals, url: string) {
-    try {
-        chrome.runtime.sendMessage({
-            type: "pageScanResult",
-            url,
-            signals,
-        });
-    } catch (e) {
-        console.warn("[AI Hygiene] Failed to send page signals:", e);
-    }
-}
-
-function scanPage() {
-    // Skip analysis for trivial/empty pages
-    if (document.body === null || document.body.children.length === 0) {
-        return;
-    }
-
-    try {
-        const signals = analyzePageContent();
-        sendPageSignals(signals, window.location.href);
-    } catch (e) {
-        console.warn("[AI Hygiene] Page scan failed:", e);
-    }
-}
-
-if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => setTimeout(scanPage, 500));
-} else {
-    setTimeout(scanPage, 500);
-}
-
-// ---------------------------------------------------------------------------
-// Risky action detection — only penalise when page is already flagged risky
-// ---------------------------------------------------------------------------
-
-// Executable / archive extensions that signal a potentially dangerous download
-const RISKY_EXTENSIONS = [
-    ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar",
-    ".zip", ".rar", ".7z", ".tar", ".gz",
-    ".dmg", ".pkg", ".apk",
+// ── Risky file extensions ─────────────────────────────────────────────────
+const RISKY_EXTS = [
+  ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs",
+  ".zip", ".rar", ".7z", ".tar", ".gz",
+  ".dmg", ".pkg", ".apk",
 ];
 
-function isRiskyDownloadLink(anchor: HTMLAnchorElement): boolean {
-    // Explicit download attribute always flagged
-    if (anchor.hasAttribute("download")) return true;
-    // Check href extension
-    try {
-        const href = anchor.href;
-        if (!href) return false;
-        const url = new URL(href);
-        const path = url.pathname.toLowerCase();
-        return RISKY_EXTENSIONS.some(ext => path.endsWith(ext));
-    } catch {
-        return false;
-    }
+interface PageSignals {
+  hasLoginForm: boolean;
+  formActionExternal: boolean;
+  hasPasswordField: boolean;
+  hasEmailField: boolean;
+  externalFormAction: string | null;
+  suspiciousPhrases: string[];
+  hasIframeEmbed: boolean;
+  /** true when password field on HTTP */
+  passwordOnHttp: boolean;
 }
 
-function isExternalLink(anchor: HTMLAnchorElement): boolean {
-    try {
-        const href = anchor.href;
-        if (!href) return false;
-        const linkHost = new URL(href).hostname;
-        const pageHost = window.location.hostname;
-        // Different host and not same-domain = external
-        return linkHost !== "" && linkHost !== pageHost;
-    } catch {
-        return false;
-    }
-}
+// ── Page analysis ─────────────────────────────────────────────────────────
+function scanPageContent(): PageSignals {
+  const signals: PageSignals = {
+    hasLoginForm: false,
+    formActionExternal: false,
+    hasPasswordField: false,
+    hasEmailField: false,
+    externalFormAction: null,
+    suspiciousPhrases: [],
+    hasIframeEmbed: false,
+    passwordOnHttp: false,
+  };
 
-/** Current page risk level — fetched once from background on load */
-let currentPageRiskLevel: "safe" | "warning" | "danger" = "safe";
+  try {
+    const forms = document.querySelectorAll("form");
+    const pwInputs = document.querySelectorAll("input[type='password']");
+    const emailInputs = document.querySelectorAll(
+      "input[type='email'], input[name='email'], input[name='username']"
+    );
 
-function reportRiskyAction(action: string): void {
-    try {
-        chrome.runtime.sendMessage({
-            type: "riskyActionDetected",
-            action,
-            pageRiskLevel: currentPageRiskLevel,
-        });
-    } catch (e) {
-        console.warn("[AI Hygiene] Failed to report risky action:", e);
-    }
-}
+    signals.hasLoginForm = forms.length > 0 || pwInputs.length > 0;
+    signals.hasPasswordField = pwInputs.length > 0;
+    signals.hasEmailField = emailInputs.length > 0;
 
-function initRiskyActionDetection(): void {
-    // Fetch the current risk level from background (non-blocking)
-    try {
-        chrome.runtime.sendMessage({ type: "getRiskLevel" }, (response) => {
-            if (response?.level) {
-                currentPageRiskLevel = response.level as "safe" | "warning" | "danger";
-            }
-        });
-    } catch {
-        // If the runtime is unavailable, fall back to "safe" (no penalty)
+    // Form action check
+    for (const form of forms) {
+      const action = form.getAttribute("action") ?? "";
+      if (action && !action.startsWith("/") && !action.startsWith(window.location.origin)) {
+        signals.formActionExternal = true;
+        signals.externalFormAction = action;
+      }
     }
 
-    // Listen for clicks on the entire document and check the target anchor
-    document.addEventListener("click", (event: MouseEvent) => {
-        // Only apply penalties when on a risky page
-        if (currentPageRiskLevel === "safe") return;
+    // Suspicious phrases
+    const bodyText = document.body?.innerText?.toLowerCase() ?? "";
+    for (const phrase of SUSPICIOUS_PHRASES) {
+      if (bodyText.includes(phrase)) signals.suspiciousPhrases.push(phrase);
+    }
 
-        const target = event.target as HTMLElement;
-        // Walk up the DOM tree to find the nearest anchor (handles clicks on child elements)
-        const anchor = target.closest("a") as HTMLAnchorElement | null;
-        if (!anchor) return;
+    // Iframe check
+    signals.hasIframeEmbed = document.querySelectorAll("iframe").length > 0;
 
-        if (isRiskyDownloadLink(anchor)) {
-            reportRiskyAction("file download on risky page");
-        } else if (isExternalLink(anchor)) {
-            reportRiskyAction("external link click on risky page");
-        }
-    }, { capture: true });
+    // Password on HTTP
+    if (signals.hasPasswordField && window.location.protocol !== "https:") {
+      signals.passwordOnHttp = true;
+    }
+  } catch {}
+
+  return signals;
 }
 
-// Initialise risky action detection after a short delay to let the page settle
+function sendSignals(signals: PageSignals): void {
+  try {
+    chrome.runtime.sendMessage({ type: "pageScanResult", url: window.location.href, signals });
+  } catch {}
+}
+
+function runPageScan(): void {
+  if (!document.body || document.body.children.length === 0) return;
+  sendSignals(scanPageContent());
+}
+
+// Run after page settles
 if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => setTimeout(initRiskyActionDetection, 600));
+  document.addEventListener("DOMContentLoaded", () => setTimeout(runPageScan, 500));
 } else {
-    setTimeout(initRiskyActionDetection, 600);
+  setTimeout(runPageScan, 500);
+}
+
+// ── Risky action detection ────────────────────────────────────────────────
+let currentRiskLevel: "safe" | "warning" | "danger" = "safe";
+
+function isRiskyDownload(a: HTMLAnchorElement): boolean {
+  if (a.hasAttribute("download")) return true;
+  try {
+    const path = new URL(a.href).pathname.toLowerCase();
+    return RISKY_EXTS.some(ext => path.endsWith(ext));
+  } catch { return false; }
+}
+
+function isExternalLink(a: HTMLAnchorElement): boolean {
+  try {
+    return new URL(a.href).hostname !== window.location.hostname;
+  } catch { return false; }
+}
+
+function reportAction(action: string): void {
+  try {
+    chrome.runtime.sendMessage({
+      type: "riskyActionDetected",
+      action,
+      pageRiskLevel: currentRiskLevel,
+    });
+  } catch {}
+}
+
+function initClickMonitor(): void {
+  // Fetch risk level once
+  try {
+    chrome.runtime.sendMessage({ type: "getRiskLevel" }, (res) => {
+      if (res?.level) currentRiskLevel = res.level;
+    });
+  } catch {}
+
+  // Listen for risk updates from background
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === "riskUpdate" && msg.level) {
+      currentRiskLevel = msg.level as typeof currentRiskLevel;
+    }
+  });
+
+  // Click listener to detect risky actions
+  document.addEventListener("click", (e: MouseEvent) => {
+    if (currentRiskLevel === "safe") return;
+    const a = (e.target as HTMLElement).closest("a") as HTMLAnchorElement | null;
+    if (!a) return;
+    if (isRiskyDownload(a)) reportAction("file download on risky page");
+    else if (isExternalLink(a)) reportAction("external link click on risky page");
+  }, { capture: true });
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => setTimeout(initClickMonitor, 600));
+} else {
+  setTimeout(initClickMonitor, 600);
 }
