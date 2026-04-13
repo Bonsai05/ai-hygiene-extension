@@ -3,13 +3,13 @@
 //
 // XP award rules:
 //   • Every unique URL visit on a safe/warning page → +5 or +10 XP
-//   • Landing on a danger page → -15 XP + streak reset
+//   • Landing on a danger page → -15 XP + streak reset (deduped per URL)
 //   • Risky action (download / ext link) on risky page → -15 XP
 //   • "Unique URL" is tracked in chrome.storage.session so it survives
 //     across SW restarts but resets on browser restart.
 //
 // ML pipeline (optional):
-//   • Backend (local FastAPI) → Offscreen Transformers.js → Heuristics only
+//   • Backend (local FastAPI / Ollama) → Offscreen Transformers.js → Heuristics only
 
 import {
   loadStats,
@@ -35,7 +35,7 @@ import {
 
 import { analyzeUrl, contentRiskFromSignals } from "./lib/risk-detection";
 import { showBrowserNotification } from "./lib/notifications";
-import { SKIP_PREFIXES, DEFAULT_BACKEND_URL, XP_PER_LEVEL } from "./lib/constants";
+import { SKIP_PREFIXES, DEFAULT_BACKEND_URL, XP_PER_LEVEL, XP } from "./lib/constants";
 
 // ---------------------------------------------------------------------------
 // Session helpers (XP deduplication per URL)
@@ -110,6 +110,7 @@ function setBadge(tabId: number, level: RiskLevel): void {
 
 // ---------------------------------------------------------------------------
 // Warning banner (Shadow DOM, tamper-proof)
+// Uses plain-English messages for non-technical users.
 // ---------------------------------------------------------------------------
 function injectBanner(tabId: number, level: "warning" | "danger"): void {
   chrome.scripting.executeScript({
@@ -133,9 +134,10 @@ function injectBanner(tabId: number, level: "warning" | "danger"): void {
 
       const isDanger = riskLevel === "danger";
       const bg = isDanger ? "#dc2626" : "#d97706";
+      // Plain-English messages for non-technical users
       const msg = isDanger
-        ? "🚨 DANGER: This site is flagged as a phishing attack. Leave immediately."
-        : "⚠️ WARNING: Suspicious signals detected. Do not enter passwords or personal data.";
+        ? "🚨 This looks like a fake website trying to steal your information. Close this tab now."
+        : "⚠️ This website might be trying to steal your password. Don't type anything here.";
 
       shadow.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;
@@ -202,7 +204,7 @@ async function notifyNewBadges(badgeIds: string[], stats: UserStats): Promise<vo
 }
 
 // ---------------------------------------------------------------------------
-// ML: Backend FastAPI (optional)
+// ML: Backend FastAPI / Ollama (optional)
 // ---------------------------------------------------------------------------
 interface MLResult { level: RiskLevel; score: number; provider: string }
 
@@ -216,7 +218,9 @@ async function queryBackend(url: string, backendUrl: string): Promise<MLResult |
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const score: number = data.phishing_score ?? (data.score / 100) ?? 0;
+    // Backend returns score as integer 0-100. data.phishing_score is a dead field — removed.
+    const rawScore = typeof data.score === "number" ? data.score : 0;
+    const score: number = rawScore / 100;
     const level: RiskLevel = score >= 0.7 ? "danger" : score >= 0.3 ? "warning" : "safe";
     return { level, score, provider: data.provider ?? "Local FastAPI" };
   } catch {
@@ -226,6 +230,8 @@ async function queryBackend(url: string, backendUrl: string): Promise<MLResult |
 
 // ---------------------------------------------------------------------------
 // ML: Offscreen Transformers.js (optional)
+// FIX: creatingOffscreen reset now happens in ensureOffscreen's catch, not
+// in queryOffscreenML's catch, so a failed creation doesn't leave a broken lock.
 // ---------------------------------------------------------------------------
 let creatingOffscreen: Promise<void> | null = null;
 
@@ -236,9 +242,13 @@ async function ensureOffscreen(): Promise<void> {
     url: "offscreen.html",
     reasons: ["WORKERS"],
     justification: "ML inference with Transformers.js",
+  }).then(() => {
+    creatingOffscreen = null;  // Success: reset lock
+  }).catch((err) => {
+    creatingOffscreen = null;  // Failure: reset lock so next call can retry
+    throw err;
   });
   await creatingOffscreen;
-  creatingOffscreen = null;
 }
 
 async function queryOffscreenML(url: string): Promise<MLResult | null> {
@@ -248,7 +258,6 @@ async function queryOffscreenML(url: string): Promise<MLResult | null> {
     if (!result) return null;
     return { level: result.level, score: result.score, provider: result.modelVersion ?? "Transformers.js" };
   } catch {
-    creatingOffscreen = null;
     return null;
   }
 }
@@ -273,6 +282,8 @@ async function getBackendSettings(): Promise<BackendSettings> {
 
 // ---------------------------------------------------------------------------
 // Core analysis + XP award
+// FIX: XP is awarded AFTER analysis completes, not before.
+// FIX: Danger pages are now deduped the same way as safe pages.
 // ---------------------------------------------------------------------------
 
 // In-memory domain cache (service worker lifetime)
@@ -330,33 +341,34 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   broadcast({ type: "riskUpdate", level: finalLevel });
   broadcast({ type: "mlRiskResult", level: finalLevel, mlScore: null, modelVersion: "Heuristic" });
 
-  // ── 5. XP awards / penalties ─────────────────────────────────────────────
+  // ── 5. XP awards / penalties — deduped per URL ───────────────────────────
+  // FIX: check dedup BEFORE awarding, for both safe AND danger.
   try {
+    const alreadyAwarded = await hasAwardedXpForUrl(url);
+    if (alreadyAwarded) return;
+
+    await markXpAwardedForUrl(url);
+
     if (finalLevel === "danger") {
       if (tabId !== undefined) await markTabAsDanger(tabId);
 
       const prevLevel = (await loadStats()).level;
       const { stats, newBadges } = await updateStats(s => applyDanger(s));
-      await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: patterns, timestamp: Date.now(), xpChange: -15 });
-      await notifyXpChange(stats, -15, "Landed on a dangerous site 🚨");
+      await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: patterns, timestamp: Date.now(), xpChange: -XP.DANGER_PENALTY });
+      await notifyXpChange(stats, -XP.DANGER_PENALTY, "Landed on a dangerous site 🚨");
       if (newBadges.length) await notifyNewBadges(newBadges, stats);
-      if (stats.level < prevLevel) { /* de-level not needed */ }
+      if (stats.level < prevLevel) { /* de-level handled by XP floor at 0 */ }
     } else {
-      // Award XP once per unique URL
-      const alreadyAwarded = await hasAwardedXpForUrl(url);
-      if (!alreadyAwarded) {
-        await markXpAwardedForUrl(url);
-        const prevLevel = (await loadStats()).level;
-        const { stats, newBadges } = await updateStats(s => applySafeBrowse(s, finalLevel));
-        const xpGained = finalLevel === "warning" ? 10 : 5;
-        await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: patterns, timestamp: Date.now(), xpChange: xpGained });
-        const msg = finalLevel === "warning"
-          ? `Browsed carefully on a risky page (+${xpGained} XP) ⚠️`
-          : `Safe visit (+${xpGained} XP) 🛡️`;
-        await notifyXpChange(stats, xpGained, msg);
-        if (newBadges.length) await notifyNewBadges(newBadges, stats);
-        if (stats.level > prevLevel) notifyLevelUp(stats.level);
-      }
+      const prevLevel = (await loadStats()).level;
+      const { stats, newBadges } = await updateStats(s => applySafeBrowse(s, finalLevel));
+      const xpGained = finalLevel === "warning" ? XP.WARNING_BROWSE : XP.SAFE_BROWSE;
+      await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: patterns, timestamp: Date.now(), xpChange: xpGained });
+      const msg = finalLevel === "warning"
+        ? `Browsed carefully on a risky page (+${xpGained} XP) ⚠️`
+        : `Safe visit (+${xpGained} XP) 🛡️`;
+      await notifyXpChange(stats, xpGained, msg);
+      if (newBadges.length) await notifyNewBadges(newBadges, stats);
+      if (stats.level > prevLevel) notifyLevelUp(stats.level);
     }
   } catch (e) {
     console.error("[AI Hygiene] XP award error:", e);
@@ -376,10 +388,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     isTabDanger(tabId).then(wasDanger => {
       if (wasDanger) {
         unmarkTabDanger(tabId);
-        const prevXp = 0; // will be read inside
         loadStats().then(prevStats => {
           updateStats(s => applyDangerAvoided(s)).then(async ({ stats, newBadges }) => {
-            await notifyXpChange(stats, 25, "Navigated away from danger 🛡️");
+            await notifyXpChange(stats, XP.DANGER_AVOIDED, "Navigated away from danger 🛡️");
             if (newBadges.length) await notifyNewBadges(newBadges, stats);
             if (stats.level > prevStats.level) notifyLevelUp(stats.level);
           });
@@ -439,11 +450,21 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
 
   // ── pageScanResult (from content script) ─────────────────────────────────
   if (message.type === "pageScanResult") {
-    const { url, signals } = message as { url: string; signals: Parameters<typeof contentRiskFromSignals>[0] };
+    const { url, signals, trackers, pageText } = message as {
+      url: string;
+      signals: Parameters<typeof contentRiskFromSignals>[0];
+      trackers?: string[];
+      pageText?: string;
+    };
     const tabId = sender.tab?.id;
 
     const urlAnalysis = analyzeUrl(url);
     const contentAnalysis = contentRiskFromSignals(signals, urlAnalysis);
+
+    // Broadcast tracker information to popup
+    if (trackers && trackers.length > 0) {
+      broadcast({ type: "trackersDetected", count: trackers.length, trackers });
+    }
 
     if (contentAnalysis.level !== "safe") {
       saveRiskLevel(contentAnalysis.level);
@@ -456,18 +477,19 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       if (contentAnalysis.level === "danger" && tabId !== undefined) {
         markTabAsDanger(tabId);
         updateStats(s => applyDanger(s)).then(({ stats, newBadges }) => {
-          notifyXpChange(stats, -15, "Dangerous page content detected 🚨");
+          notifyXpChange(stats, -XP.DANGER_PENALTY, "Dangerous page content detected 🚨");
           if (newBadges.length) notifyNewBadges(newBadges, stats);
         });
       }
     }
 
     // Habit signals
-    if (signals.passwordOnHttp) {
+    const isPasswordOnHttp = signals.passwordOnHttp || signals.missingSecurityIndicators;
+    if (isPasswordOnHttp) {
       updateStats(s => applyPasswordOnHttp(s)).then(({ stats, newBadges }) => {
         if (newBadges.length) notifyNewBadges(newBadges, stats);
       });
-    } else if (signals.hasPasswordField && !signals.passwordOnHttp && url.startsWith("https://")) {
+    } else if (signals.hasPasswordField && !isPasswordOnHttp && url.startsWith("https://")) {
       updateStats(s => applySecureLogin(s)).then(({ stats, newBadges }) => {
         if (newBadges.length) notifyNewBadges(newBadges, stats);
       });
@@ -482,7 +504,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     const { pageRiskLevel, action } = message as { pageRiskLevel: string; action: string };
     if (pageRiskLevel === "warning" || pageRiskLevel === "danger") {
       updateStats(s => applyRiskyAction(s)).then(({ stats }) => {
-        notifyXpChange(stats, -15, `Risky action on flagged page: ${action} 🚨`);
+        notifyXpChange(stats, -XP.RISKY_ACTION_PENALTY, `Risky action on flagged page: ${action} 🚨`);
       });
     }
     sendResponse({ ok: true });
@@ -491,7 +513,6 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
 
   // ── dismissWarning ────────────────────────────────────────────────────────
   if (message.type === "dismissWarning") {
-    // No XP change for dismiss, just acknowledge
     sendResponse({ ok: true });
     return true;
   }
@@ -508,7 +529,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
   if (message.type === "recoveryCompleted") {
     loadStats().then(prevStats => {
       updateStats(s => applyRecoveryCompleted(s)).then(async ({ stats, newBadges }) => {
-        await notifyXpChange(stats, 30, "Recovery completed! +30 XP 💪");
+        await notifyXpChange(stats, XP.PANIC_RECOVERY, "Recovery completed! +30 XP 💪");
         if (newBadges.length) await notifyNewBadges(newBadges, stats);
         if (stats.level > prevStats.level) notifyLevelUp(stats.level);
         sendResponse({ stats });
@@ -541,6 +562,26 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
+  // ── Daemon manager (heavy model / Ollama) ─────────────────────────────────
+  if (message.type === "detectRuntime") {
+    detectAvailableRuntime().then(runtime => sendResponse(runtime));
+    return true;
+  }
+
+  if (message.type === "installOllama") {
+    chrome.tabs.create({ url: "https://ollama.com/download" });
+    pollForRuntime("ollama", 120_000).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === "pullModel") {
+    const { model } = message as { model: string };
+    pullModelWithProgress(model, (pct) => {
+      broadcast({ type: "modelPullProgress", percent: pct });
+    }).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -559,12 +600,82 @@ function defaultNotificationSettings(): NotificationSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon manager helpers (Ollama / LM Studio / Lemonade detection)
+// ---------------------------------------------------------------------------
+type DaemonRuntime = "ollama" | "lemonade" | "lmstudio" | "none";
+
+async function detectAvailableRuntime(): Promise<DaemonRuntime> {
+  const endpoints = [
+    { url: "http://localhost:11434/api/tags", runtime: "ollama" as const },
+    { url: "http://localhost:8000/health", runtime: "lemonade" as const },
+    { url: "http://localhost:1234/v1/models", runtime: "lmstudio" as const },
+  ];
+
+  for (const { url, runtime } of endpoints) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) return runtime;
+    } catch {}
+  }
+  return "none";
+}
+
+async function pollForRuntime(runtime: DaemonRuntime, timeoutMs: number): Promise<void> {
+  const startTime = Date.now();
+  const urlMap: Record<string, string> = {
+    ollama: "http://localhost:11434/api/tags",
+    lemonade: "http://localhost:8000/health",
+    lmstudio: "http://localhost:1234/v1/models",
+  };
+  const checkUrl = urlMap[runtime];
+  if (!checkUrl) throw new Error("Unknown runtime");
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const res = await fetch(checkUrl, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) return;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  throw new Error(`Runtime ${runtime} not available after ${timeoutMs}ms`);
+}
+
+async function pullModelWithProgress(model: string, onProgress: (pct: number) => void): Promise<void> {
+  const res = await fetch("http://localhost:11434/api/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: model, stream: true }),
+  });
+
+  if (!res.ok) throw new Error(`Pull failed: ${res.status}`);
+  if (!res.body) throw new Error("No response body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const lines = decoder.decode(value).split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const data = JSON.parse(line);
+        if (data.total && data.completed) {
+          onProgress(Math.round((data.completed / data.total) * 100));
+        }
+        if (data.status === "success") onProgress(100);
+      } catch {}
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await loadStats();
   if (!existing.createdAt || existing.createdAt === 0) {
-    // Fresh install — save defaults with timestamps
     const { getDefaultStats } = await import("./lib/storage");
     await saveStats({ ...getDefaultStats(), createdAt: Date.now(), lastUpdated: Date.now() });
   }

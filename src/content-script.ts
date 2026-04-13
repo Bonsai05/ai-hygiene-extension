@@ -18,6 +18,23 @@ const SUSPICIOUS_PHRASES = [
   "urgent action required",
 ];
 
+// ── Known tracker scripts ─────────────────────────────────────────────────
+const KNOWN_TRACKERS = [
+  "google-analytics.com",
+  "doubleclick.net",
+  "facebook.com/tr",
+  "hotjar.com",
+  "fullstory.com",
+  "mixpanel.com",
+  "amplitude.com",
+  "segment.com",
+  "heap.io",
+  "clarity.ms",
+  "mouseflow.com",
+  "intercom.com",
+  "crisp.chat",
+];
+
 // ── Risky file extensions ─────────────────────────────────────────────────
 const RISKY_EXTS = [
   ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs",
@@ -33,8 +50,36 @@ interface PageSignals {
   externalFormAction: string | null;
   suspiciousPhrases: string[];
   hasIframeEmbed: boolean;
-  /** true when password field on HTTP */
+  /** true when password field on HTTP — canonical field for background.ts */
   passwordOnHttp: boolean;
+  /** same as passwordOnHttp — alias for risk-detection.ts interface */
+  missingSecurityIndicators: boolean;
+  hasObfuscatedText: boolean;
+}
+
+// ── Page text extraction (for ML content analysis) ────────────────────────
+function extractPageText(): string {
+  try {
+    const clone = document.body.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll("script, style, noscript").forEach(el => el.remove());
+    const text = clone.innerText ?? clone.textContent ?? "";
+    return text.slice(0, 2000); // ~512 tokens for ML
+  } catch {
+    return "";
+  }
+}
+
+// ── Tracker detection ─────────────────────────────────────────────────────
+function detectTrackers(): string[] {
+  try {
+    const scripts = Array.from(document.querySelectorAll("script[src]"))
+      .map(s => s.getAttribute("src") ?? "");
+    return KNOWN_TRACKERS.filter(tracker =>
+      scripts.some(src => src.includes(tracker))
+    );
+  } catch {
+    return [];
+  }
 }
 
 // ── Page analysis ─────────────────────────────────────────────────────────
@@ -48,6 +93,8 @@ function scanPageContent(): PageSignals {
     suspiciousPhrases: [],
     hasIframeEmbed: false,
     passwordOnHttp: false,
+    missingSecurityIndicators: false,
+    hasObfuscatedText: false,
   };
 
   try {
@@ -79,24 +126,41 @@ function scanPageContent(): PageSignals {
     // Iframe check
     signals.hasIframeEmbed = document.querySelectorAll("iframe").length > 0;
 
-    // Password on HTTP
+    // Password on HTTP — set both field names for compatibility
     if (signals.hasPasswordField && window.location.protocol !== "https:") {
       signals.passwordOnHttp = true;
+      signals.missingSecurityIndicators = true;
     }
+
+    // Obfuscated inline script detection
+    const inlineScripts = Array.from(document.querySelectorAll("script:not([src])"))
+      .map(s => s.textContent ?? "");
+    const combined = inlineScripts.join("\n");
+    signals.hasObfuscatedText = /eval\s*\(|atob\s*\(|unescape\s*\(/.test(combined);
+
   } catch {}
 
   return signals;
 }
 
-function sendSignals(signals: PageSignals): void {
+function sendSignals(signals: PageSignals, trackers: string[], pageText: string): void {
   try {
-    chrome.runtime.sendMessage({ type: "pageScanResult", url: window.location.href, signals });
+    chrome.runtime.sendMessage({
+      type: "pageScanResult",
+      url: window.location.href,
+      signals,
+      trackers,
+      pageText,
+    });
   } catch {}
 }
 
 function runPageScan(): void {
   if (!document.body || document.body.children.length === 0) return;
-  sendSignals(scanPageContent());
+  const signals = scanPageContent();
+  const trackers = detectTrackers();
+  const pageText = extractPageText();
+  sendSignals(signals, trackers, pageText);
 }
 
 // Run after page settles

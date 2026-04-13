@@ -19,7 +19,7 @@ export const STORAGE_KEYS = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// XP values
+// XP values (used in production code — storage.ts, background.ts)
 // ---------------------------------------------------------------------------
 export const XP = {
   SAFE_BROWSE: 5,
@@ -31,6 +31,25 @@ export const XP = {
   PANIC_INITIATED: 5,
   PANIC_RECOVERY: 30,
   BADGE_BONUS: 50,
+  STREAK_BONUS: 15,
+} as const;
+
+// ---------------------------------------------------------------------------
+// XP_REWARDS — test-compatible alias export
+// gamification.test.ts imports these names specifically.
+// BADGE_EARNED corresponds to XP.BADGE_BONUS
+// PANIC_RECOVERY_COMPLETE corresponds to XP.PANIC_RECOVERY
+// ---------------------------------------------------------------------------
+export const XP_REWARDS = {
+  SAFE_BROWSE: 5,
+  WARNING_BROWSE: 10,
+  DANGER_PENALTY: 15,
+  RISKY_ACTION_PENALTY: 15,
+  DANGER_AVOIDED: 25,
+  SECURE_LOGIN: 10,
+  PANIC_INITIATED: 5,
+  PANIC_RECOVERY_COMPLETE: 30,
+  BADGE_EARNED: 50,
   STREAK_BONUS: 15,
 } as const;
 
@@ -92,7 +111,8 @@ export const SUSPICIOUS_PHRASES = [
   "urgent action required",
 ] as const;
 
-// Skip analysis for these URL prefixes
+// Skip analysis for these URL prefixes.
+// IMPORTANT: localhost is included to prevent false analyses on dev environments.
 export const SKIP_PREFIXES = [
   "chrome://",
   "chrome-extension://",
@@ -101,6 +121,8 @@ export const SKIP_PREFIXES = [
   "devtools://",
   "file://",
   "view-source:",
+  "http://localhost",
+  "https://localhost",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -117,3 +139,22 @@ export const STREAK_MILESTONES: Record<number, string> = {
 // ---------------------------------------------------------------------------
 export const TOAST_COOLDOWN_MS = 4000;
 export const XP_SESSION_KEY = "xpAwardedUrls";
+
+// ---------------------------------------------------------------------------
+// Tracker detection — known third-party trackers
+// ---------------------------------------------------------------------------
+export const KNOWN_TRACKERS = [
+  "google-analytics.com",
+  "doubleclick.net",
+  "facebook.com/tr",
+  "hotjar.com",
+  "fullstory.com",
+  "mixpanel.com",
+  "amplitude.com",
+  "segment.com",
+  "heap.io",
+  "clarity.ms",
+  "mouseflow.com",
+  "intercom.com",
+  "crisp.chat",
+] as const;
