@@ -76,8 +76,24 @@ export const LEVEL_TITLES: Record<number, string> = {
 // Risk detection
 // ---------------------------------------------------------------------------
 export const KNOWN_BRANDS = [
+  // Big tech & search
   "google", "microsoft", "apple", "amazon", "facebook", "meta",
-  "paypal", "stripe", "netflix", "spotify", "dropbox", "adobe", "github",
+  // Social / Video
+  "youtube", "twitter", "x", "instagram", "reddit", "linkedin", "twitch",
+  "tiktok", "pinterest", "snapchat", "discord",
+  // Productivity / Cloud
+  "github", "gitlab", "bitbucket", "notion", "slack", "zoom", "teams",
+  "dropbox", "drive", "onedrive", "icloud",
+  // Commerce / Finance
+  "paypal", "stripe", "shopify", "ebay", "etsy",
+  // Media / Entertainment
+  "netflix", "spotify", "hulu", "disneyplus", "twitch", "soundcloud",
+  // Utilities / Info
+  "wikipedia", "wikimedia", "stackoverflow", "stackexchange",
+  "adobe", "figma", "canva", "atlassian", "jira", "confluence",
+  // Dev tools
+  "npmjs", "pypi", "docker", "cloudflare", "vercel", "netlify",
+  "heroku", "digitalocean", "aws", "azure",
 ] as const;
 
 export const SUSPICIOUS_TLDS = [".tk", ".ml", ".ga", ".cf", ".gq", ".xyz", ".top", ".work"] as const;
@@ -97,18 +113,19 @@ export const TYPOSQUAT_PATTERNS = [
   /^g00g1e\./,
 ] as const;
 
+// Phrases that are strong indicators of phishing — must be specific enough
+// to avoid false positives on legitimate sites.
 export const SUSPICIOUS_PHRASES = [
   "verify your account",
   "confirm your identity",
-  "update your information",
   "suspend your account",
-  "unusual activity",
   "verify your password",
   "click here to verify",
-  "your account has been",
   "confirm your account",
-  "security alert",
   "urgent action required",
+  "your account will be suspended",
+  "enter your credit card",
+  "validate your account",
 ] as const;
 
 // Skip analysis for these URL prefixes.

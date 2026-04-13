@@ -1,9 +1,19 @@
 // src/popup/pages/Settings.tsx
-// Settings page — backend configuration and notification preferences.
+// Settings page — backend configuration, notification preferences, and AI model status.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { DEFAULT_BACKEND_URL } from "../../lib/constants";
+import {
+  MODELS,
+  defaultModelStatusMap,
+  type ModelKey,
+  type ModelStatus,
+  type ModelStatusMap,
+} from "../../lib/model-registry";
 
+// ---------------------------------------------------------------------------
+// Settings interfaces
+// ---------------------------------------------------------------------------
 interface BackendSettings {
   enabled: boolean;
   useLocalBackend: boolean;
@@ -21,6 +31,14 @@ interface SettingsPageProps {
   onBack: () => void;
 }
 
+// ---------------------------------------------------------------------------
+// Model keys in priority order (display order)
+// ---------------------------------------------------------------------------
+const MODEL_ORDER: ModelKey[] = ["URL_PHISHING", "CONTENT_SCAM", "BERT_PHISHING", "PII_DETECTION"];
+
+// ---------------------------------------------------------------------------
+// Main Settings page
+// ---------------------------------------------------------------------------
 export function SettingsPage({ onBack }: SettingsPageProps) {
   const [backend, setBackend] = useState<BackendSettings>({
     enabled: true,
@@ -39,6 +57,9 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [urlError, setUrlError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [modelStatus, setModelStatus] = useState<ModelStatusMap>(defaultModelStatusMap());
+  const [downloadTriggered, setDownloadTriggered] = useState(false);
+  const listenerRef = useRef<((msg: Record<string, unknown>) => void) | null>(null);
 
   const isValidUrl = (url: string): boolean => {
     if (!url) return true;
@@ -48,11 +69,20 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     } catch { return false; }
   };
 
+  // Load settings from background
   const loadSettings = useCallback(async () => {
     try {
       const res = await chrome.runtime.sendMessage({ type: "getSettings" });
       if (res?.backend) setBackend(res.backend);
       if (res?.notifications) setNotifications(res.notifications);
+    } catch {}
+  }, []);
+
+  // Load model status from background (which reads from offscreen or storage)
+  const loadModelStatus = useCallback(async () => {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "getModelStatus" });
+      if (res?.statusMap) setModelStatus(res.statusMap as ModelStatusMap);
     } catch {}
   }, []);
 
@@ -70,8 +100,31 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
   useEffect(() => {
     loadSettings();
+    loadModelStatus();
     checkStatus();
-  }, [loadSettings, checkStatus]);
+
+    // Listen for model status updates and progress broadcasts from background
+    const handler = (msg: Record<string, unknown>) => {
+      if (msg.type === "modelStatusUpdate" && msg.statusMap) {
+        setModelStatus(msg.statusMap as ModelStatusMap);
+      }
+      if (msg.type === "modelProgress" && msg.key && typeof msg.progress === "number") {
+        setModelStatus((prev) => ({
+          ...prev,
+          [msg.key as ModelKey]: {
+            ...prev[msg.key as ModelKey],
+            state: "downloading",
+            progress: msg.progress as number,
+          },
+        }));
+      }
+    };
+    listenerRef.current = handler;
+    chrome.runtime.onMessage.addListener(handler);
+    return () => {
+      if (listenerRef.current) chrome.runtime.onMessage.removeListener(listenerRef.current);
+    };
+  }, [loadSettings, loadModelStatus, checkStatus]);
 
   async function handleSave() {
     setSaving(true);
@@ -97,6 +150,20 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       alert(`❌ Cannot reach ${backend.backendUrl}. Make sure the backend is running.`);
     }
   }
+
+  async function handleDownloadModels() {
+    setDownloadTriggered(true);
+    try {
+      await chrome.runtime.sendMessage({ type: "downloadModels" });
+    } catch {
+      // If the message fails the offscreen will handle it anyway
+    }
+    // Reload status after a short delay
+    setTimeout(loadModelStatus, 1500);
+  }
+
+  const allReady = MODEL_ORDER.every((k) => modelStatus[k]?.state === "ready");
+  const anyDownloading = MODEL_ORDER.some((k) => modelStatus[k]?.state === "downloading");
 
   const statusColors = {
     running: "bg-green-100 text-green-800",
@@ -138,6 +205,43 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
           <p className="text-xs text-muted-foreground mt-1 font-mono">
             ℹ️ Only flags sites when phishing confidence ≥ 55%. Everyday sites like Google, YouTube, etc. are never flagged.
           </p>
+        </Section>
+
+        {/* ── AI Models ───────────────────────────────────────────────────── */}
+        <Section title="On-Device AI Models">
+          <p className="text-xs text-muted-foreground">
+            Models are downloaded once and cached locally — your data never leaves your device.
+          </p>
+
+          <div className="space-y-3 mt-1">
+            {MODEL_ORDER.map((key) => (
+              <ModelCard key={key} modelKey={key} status={modelStatus[key]} />
+            ))}
+          </div>
+
+          {/* Download / status summary button */}
+          <div className="mt-3 flex items-center gap-3">
+            {!allReady && !anyDownloading && (
+              <button
+                id="settings-download-models-btn"
+                onClick={handleDownloadModels}
+                disabled={downloadTriggered}
+                className="text-xs px-3 py-1.5 border-2 border-border bg-foreground text-background font-mono hover:opacity-80 transition-opacity disabled:opacity-50"
+              >
+                {downloadTriggered ? "Starting…" : "Download All Models"}
+              </button>
+            )}
+            {anyDownloading && (
+              <span className="text-xs text-amber-700 font-mono animate-pulse">
+                ⬇ Downloading models…
+              </span>
+            )}
+            {allReady && (
+              <span className="text-xs text-emerald-700 font-mono font-bold">
+                ✅ All models ready
+              </span>
+            )}
+          </div>
         </Section>
 
         {/* ── Local NPU Daemon ────────────────────────────────────────────── */}
@@ -204,8 +308,65 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   );
 }
 
-// ── Helper components ────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// ModelCard — displays one model's status and progress bar
+// ---------------------------------------------------------------------------
+function ModelCard({ modelKey, status }: { modelKey: ModelKey; status: ModelStatus }) {
+  const model = MODELS[modelKey];
 
+  const stateBadge: Record<string, { label: string; className: string }> = {
+    idle:        { label: "Not Downloaded",  className: "bg-gray-100 text-gray-600" },
+    downloading: { label: "Downloading…",    className: "bg-amber-100 text-amber-800 animate-pulse" },
+    ready:       { label: "Ready ✅",         className: "bg-emerald-100 text-emerald-800" },
+    failed:      { label: "Failed ❌",        className: "bg-red-100 text-red-800" },
+  };
+
+  const badge = stateBadge[status?.state ?? "idle"];
+
+  return (
+    <div className="border border-border bg-white p-3 space-y-2">
+      {/* Header row */}
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-bold text-foreground truncate">{model.nickname}</p>
+          <p className="text-[10px] text-muted-foreground mt-0.5 leading-relaxed">{model.description}</p>
+        </div>
+        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 whitespace-nowrap ${badge.className}`}>
+          {badge.label}
+        </span>
+      </div>
+
+      {/* Size indicator */}
+      <p className="text-[10px] text-muted-foreground font-mono">
+        Size: {model.size} · Model: <span className="opacity-60 break-all">{model.id}</span>
+      </p>
+
+      {/* Progress bar — only visible while downloading */}
+      {status?.state === "downloading" && (
+        <div className="space-y-1">
+          <div className="w-full h-2 bg-gray-200 border border-border overflow-hidden">
+            <div
+              className="h-full bg-foreground transition-all duration-300"
+              style={{ width: `${status.progress ?? 0}%` }}
+            />
+          </div>
+          <p className="text-[10px] text-muted-foreground text-right font-mono">
+            {status.progress ?? 0}%
+          </p>
+        </div>
+      )}
+
+      {/* Error message */}
+      {status?.state === "failed" && status.error && (
+        <p className="text-[10px] text-red-600 font-mono break-words">{status.error}</p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helper components
+// ---------------------------------------------------------------------------
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="space-y-3">

@@ -7,6 +7,7 @@ import { XPProgressBar } from "./components/XPBar";
 import { BadgeGrid } from "./components/Badges";
 import { QuickTips } from "./components/QuickTips";
 import { PanicButton } from "./components/PanicButton";
+import { ThreatList } from "./components/ThreatList";
 import { SettingsPage } from "./pages/Settings";
 import { OnboardingPage } from "./pages/Onboarding";
 import type { UserStats } from "../lib/storage";
@@ -32,6 +33,7 @@ export default function Popup() {
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [xpToast, setXpToast] = useState<XpToast | null>(null);
   const [levelUpToast, setLevelUpToast] = useState<LevelUpToast | null>(null);
+  const [threats, setThreats] = useState<string[]>([]);
 
   const loadData = useCallback(async () => {
     try {
@@ -41,7 +43,7 @@ export default function Popup() {
     finally { setLoading(false); }
   }, []);
 
-  // Show XP toast for N ms
+  // Show XP toast for N ms (auto-dismiss, also dismissible manually)
   const showXpToast = useCallback((toast: XpToast, duration = 3500) => {
     setXpToast(toast);
     setTimeout(() => setXpToast(null), duration);
@@ -68,6 +70,12 @@ export default function Popup() {
         setLevelUpToast({ level: msg.level as number, levelTitle: msg.levelTitle as string });
         loadData();
         setTimeout(() => setLevelUpToast(null), 4500);
+      }
+      if (msg.type === "threatUpdate" && Array.isArray(msg.threats)) {
+        setThreats(msg.threats as string[]);
+      }
+      if (msg.type === "mlRiskResult" && Array.isArray(msg.threats)) {
+        setThreats(msg.threats as string[]);
       }
     };
     chrome.runtime.onMessage.addListener(handler);
@@ -113,7 +121,7 @@ export default function Popup() {
         <div>
           <h1 className="text-xl font-bold font-['Syne']">AI Hygiene Companion</h1>
           <p className="text-[10px] text-muted-foreground mt-1">
-            Level {stats.level} — {levelTitle}
+            Level {stats.level} &mdash; {levelTitle}
           </p>
         </div>
         <button
@@ -122,7 +130,7 @@ export default function Popup() {
           className="size-8 border-2 border-border flex items-center justify-center text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
           title="Settings"
         >
-          ⚙
+          &#9881;
         </button>
       </div>
 
@@ -135,6 +143,7 @@ export default function Popup() {
           level={stats.level}
           levelTitle={levelTitle}
         />
+        <ThreatList initialThreats={threats} />
         <BadgeGrid badges={stats.badges} />
         <QuickTips tips={stats.tips} />
         <div className="pt-2">
@@ -142,30 +151,51 @@ export default function Popup() {
         </div>
       </div>
 
-      {/* ── XP Toast ──────────────────────────────────────────────────────── */}
+      {/* ── XP Toast (auto-dismiss + manual dismiss button) ────────────────── */}
       {xpToast && (
-        <div className={`absolute top-16 right-4 left-4 border-2 border-border p-3 z-40
-          animate-in slide-in-from-top-2 fade-in duration-200
-          ${xpToast.isLoss ? "bg-red-600 text-white" : "bg-foreground text-background"}`}>
-          <p className="text-xs font-bold">
-            {xpToast.isLoss ? `-${xpToast.xpAmount} XP` : `+${xpToast.xpAmount} XP`}
-          </p>
-          <p className="text-[10px] opacity-80">{xpToast.reason}</p>
+        <div
+          className={`absolute top-16 right-4 left-4 border-2 border-border p-3 z-40
+            animate-in slide-in-from-top-2 fade-in duration-200
+            ${xpToast.isLoss ? "bg-red-600 text-white" : "bg-foreground text-background"}`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-bold">
+                {xpToast.isLoss ? `-${xpToast.xpAmount} XP` : `+${xpToast.xpAmount} XP`}
+              </p>
+              <p className="text-[10px] opacity-80 mt-0.5">{xpToast.reason}</p>
+            </div>
+            <button
+              id="popup-xp-toast-dismiss-btn"
+              onClick={() => setXpToast(null)}
+              className="flex-shrink-0 w-5 h-5 flex items-center justify-center opacity-70 hover:opacity-100 transition-opacity text-base leading-none"
+              aria-label="Dismiss notification"
+            >
+              &times;
+            </button>
+          </div>
         </div>
       )}
 
-      {/* ── Level-up toast ────────────────────────────────────────────────── */}
+      {/* ── Level-up toast (auto-dismiss + manual dismiss button) ─────────── */}
       {levelUpToast && (
-        <div className="absolute top-4 right-4 left-4 border-4 border-border bg-background p-4 z-50
-          animate-in slide-in-from-top-4 fade-in duration-300">
-          <div className="flex items-center gap-3">
-            <div className="text-2xl">⬆</div>
-            <div>
+        <div className="absolute top-4 right-4 left-4 border-4 border-border bg-background p-4 z-50 animate-in slide-in-from-top-4 fade-in duration-300">
+          <div className="flex items-start gap-3">
+            <div className="text-2xl flex-shrink-0">&#11014;</div>
+            <div className="flex-1 min-w-0">
               <p className="text-sm font-bold font-['Syne']">Level Up!</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                You are now Level {levelUpToast.level} — {levelUpToast.levelTitle}
+                You are now Level {levelUpToast.level} &mdash; {levelUpToast.levelTitle}
               </p>
             </div>
+            <button
+              id="popup-levelup-toast-dismiss-btn"
+              onClick={() => setLevelUpToast(null)}
+              className="flex-shrink-0 w-6 h-6 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors text-lg leading-none border border-border"
+              aria-label="Dismiss level up notification"
+            >
+              &times;
+            </button>
           </div>
         </div>
       )}
@@ -176,11 +206,11 @@ export default function Popup() {
           <div className="bg-background border-2 border-border rounded-lg p-4 m-4 max-h-[85%] overflow-y-auto">
             <div className="flex items-center gap-3 mb-3">
               <div className="size-10 bg-red-600 text-white border-2 border-border flex items-center justify-center flex-shrink-0 text-lg">
-                ⚠️
+                &#9888;&#65039;
               </div>
               <div>
                 <h2 className="text-base font-bold font-['Syne'] leading-tight">
-                  It&apos;s Okay — Let&apos;s Work Through This Together
+                  It&apos;s Okay &mdash; Let&apos;s Work Through This Together
                 </h2>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
                   Follow these steps in order. You&apos;ve got this.

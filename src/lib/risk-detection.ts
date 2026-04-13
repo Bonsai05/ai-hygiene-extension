@@ -35,6 +35,32 @@ export interface PageRiskSignals {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if hostname matches a known-safe brand domain.
+ * Handles: google.com, www.google.com, accounts.google.com,
+ *          youtube.co.uk, google.co.jp, etc.
+ */
+function isKnownBrandHostname(hostname: string): boolean {
+  return KNOWN_BRANDS.some(brand => {
+    // Exact match: brand.com
+    if (hostname === brand + ".com") return true;
+    // Subdomain of brand.com: www.brand.com, accounts.brand.com
+    if (hostname.endsWith("." + brand + ".com")) return true;
+    // Country-code TLD variants: brand.co.uk, brand.com.au, brand.co.jp
+    if (hostname === brand + ".co.uk" || hostname.endsWith("." + brand + ".co.uk")) return true;
+    if (hostname === brand + ".com.au" || hostname.endsWith("." + brand + ".com.au")) return true;
+    // Generic: brand.net, brand.org, brand.io for dev tools
+    if (hostname === brand + ".org" || hostname.endsWith("." + brand + ".org")) return true;
+    if (hostname === brand + ".io" || hostname.endsWith("." + brand + ".io")) return true;
+    if (hostname === brand + ".net" || hostname.endsWith("." + brand + ".net")) return true;
+    return false;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // URL analysis
 // ---------------------------------------------------------------------------
 export function analyzeUrl(url: string): RiskAnalysis {
@@ -60,7 +86,7 @@ export function analyzeUrl(url: string): RiskAnalysis {
     }
 
     // ── Known brand domains → always safe (avoids false positives on accounts.google.com etc.) ──
-    if (KNOWN_BRANDS.some(brand => hostname === brand + ".com" || hostname.endsWith("." + brand + ".com"))) {
+    if (isKnownBrandHostname(hostname)) {
       return { level: "safe", score: 10, patterns: ["known_brand"], reason: "Verified brand domain." };
     }
 
@@ -73,6 +99,7 @@ export function analyzeUrl(url: string): RiskAnalysis {
       patterns.push("redirect_param");
     }
 
+    // Require 2+ warning signals to flag (same as before)
     if (patterns.length >= 2) {
       return { level: "warning", score: 50, patterns, reason: "Multiple suspicious patterns in URL." };
     }
@@ -108,15 +135,21 @@ export function analyzePageContent(): PageRiskSignals {
       "input[type='email'], input[name='email'], input[name='username']"
     );
 
-    signals.hasLoginForm = forms.length > 0 || pwInputs.length > 0;
     signals.hasPasswordField = pwInputs.length > 0;
     signals.hasEmailField = emailInputs.length > 0;
+    // A "login form" must have a password field — not just any form on the page
+    signals.hasLoginForm = pwInputs.length > 0;
 
-    // Form action check
+    // Form action check — only flag if the action is an absolute external URL
     const currentOrigin = typeof window !== "undefined" ? window.location.origin : "";
     for (const form of forms) {
       const action = form.getAttribute("action") ?? "";
-      if (action && !action.startsWith("/") && !action.startsWith(currentOrigin)) {
+      // Skip empty, relative paths ("/login"), and same-origin actions
+      if (
+        action &&
+        (action.startsWith("http://") || action.startsWith("https://")) &&
+        !action.startsWith(currentOrigin)
+      ) {
         signals.formActionExternal = true;
         signals.externalFormAction = action;
       }
@@ -128,8 +161,8 @@ export function analyzePageContent(): PageRiskSignals {
       if (bodyText.includes(phrase)) signals.suspiciousPhrases.push(phrase);
     }
 
-    // Iframe check
-    signals.hasIframeEmbed = document.querySelectorAll("iframe").length > 0;
+    // Iframe check - only flag if there's also a login form (password field)
+    signals.hasIframeEmbed = signals.hasPasswordField && document.querySelectorAll("iframe").length > 0;
 
     // Password on HTTP
     const protocol = typeof window !== "undefined" ? window.location.protocol : "https:";
@@ -138,11 +171,12 @@ export function analyzePageContent(): PageRiskSignals {
       signals.passwordOnHttp = true;
     }
 
-    // Obfuscated text detection (basic: inline scripts with encoded content)
+    // Obfuscated text detection — requires eval() with atob or unescape (not just atob alone)
+    // atob() is used legitimately by many sites (YouTube, analytics, etc.)
     const inlineScripts = Array.from(document.querySelectorAll("script:not([src])"))
       .map(s => s.textContent ?? "");
     const combined = inlineScripts.join("\n");
-    signals.hasObfuscatedText = /eval\s*\(|atob\s*\(|unescape\s*\(/.test(combined);
+    signals.hasObfuscatedText = /eval\s*\(\s*(?:atob|unescape)/.test(combined);
 
   } catch {}
 
@@ -158,6 +192,10 @@ export function contentRiskFromSignals(
 ): RiskAnalysis {
   // If URL is already danger, content can't downgrade it
   if (urlAnalysis.level === "danger") return urlAnalysis;
+
+  // If URL is a known safe brand, ONLY escalate for the most critical signals
+  // (password on HTTP or external form submission) — never for iframe/obfuscation alone
+  const isSafeBrand = urlAnalysis.patterns.includes("known_brand");
 
   const patterns = [...urlAnalysis.patterns];
   let level = urlAnalysis.level;
@@ -175,25 +213,30 @@ export function contentRiskFromSignals(
     return { level: "danger", score: 85, patterns, reason: "Login form submits credentials to external domain." };
   }
 
-  // 3+ suspicious phrases → escalate
-  if (signals.suspiciousPhrases.length >= 3) {
+  // Skip softer signals for known-safe brand domains
+  if (isSafeBrand) {
+    return { level: "safe", score: urlAnalysis.score, patterns, reason: urlAnalysis.reason };
+  }
+
+  // 5+ suspicious phrases on an unknown site → escalate
+  if (signals.suspiciousPhrases.length >= 5) {
     patterns.push("urgency_language_detected");
     if (level === "safe") level = "warning";
   }
 
-  // Login form + urgency → escalate
-  if (signals.hasLoginForm && signals.suspiciousPhrases.length >= 2) {
+  // Login form (with actual password field) + 3+ urgency phrases → escalate
+  if (signals.hasLoginForm && signals.suspiciousPhrases.length >= 3) {
     patterns.push("phishing_characteristics");
     if (level === "safe") level = "warning";
   }
 
-  // Login form + iframe
+  // Login form (with actual password field) + iframe on unknown site
   if (signals.hasLoginForm && signals.hasIframeEmbed) {
     patterns.push("login_form_with_iframe");
     if (level === "safe") level = "warning";
   }
 
-  // Obfuscated text adds risk
+  // Obfuscated text adds risk only on non-branded unknown sites
   if (signals.hasObfuscatedText) {
     patterns.push("obfuscated_script");
     if (level === "safe") level = "warning";

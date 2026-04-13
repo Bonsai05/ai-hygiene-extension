@@ -8,8 +8,12 @@
 //   • "Unique URL" is tracked in chrome.storage.session so it survives
 //     across SW restarts but resets on browser restart.
 //
-// ML pipeline (optional):
-//   • Backend (local FastAPI / Ollama) → Offscreen Transformers.js → Heuristics only
+// ML pipeline (3 models, no TinyBERT):
+//   Layer 1A: pirocheto/phishing-url-detection      — URL lexical analysis
+//   Layer 1B: phishbot/ScamLLM                      — social engineering content
+//   Layer 1C: onnx-community/bert-finetuned-phishing — DOM text / credential harvesting
+//   Layer 1D: gravitee-io/bert-small-pii-detection  — PII leakage in form fields
+//   Models are downloaded sequentially by the offscreen doc on first run.
 
 import {
   loadStats,
@@ -36,6 +40,7 @@ import {
 import { analyzeUrl, contentRiskFromSignals } from "./lib/risk-detection";
 import { showBrowserNotification } from "./lib/notifications";
 import { SKIP_PREFIXES, DEFAULT_BACKEND_URL, XP_PER_LEVEL, XP } from "./lib/constants";
+import { MODEL_STATUS_STORAGE_KEY, defaultModelStatusMap, type ModelStatusMap } from "./lib/model-registry";
 
 // ---------------------------------------------------------------------------
 // Session helpers (XP deduplication per URL)
@@ -110,14 +115,20 @@ function setBadge(tabId: number, level: RiskLevel): void {
 
 // ---------------------------------------------------------------------------
 // Warning banner (Shadow DOM, tamper-proof)
-// Uses plain-English messages for non-technical users.
+// Richer version: shows risk score + threat list
 // ---------------------------------------------------------------------------
-function injectBanner(tabId: number, level: "warning" | "danger"): void {
+function injectBanner(
+  tabId: number,
+  level: "warning" | "danger",
+  score = 0,
+  threats: string[] = []
+): void {
   chrome.scripting.executeScript({
     target: { tabId },
-    func: (riskLevel: string) => {
+    func: (riskLevel: string, riskScore: number, threatList: string[]) => {
       const BANNER_ID = "ai-hygiene-banner-host";
-      if (document.getElementById(BANNER_ID)) return;
+      // Remove existing banner before re-injecting (score/threats may have changed)
+      document.getElementById(BANNER_ID)?.remove();
 
       const host = document.createElement("div");
       host.id = BANNER_ID;
@@ -134,20 +145,31 @@ function injectBanner(tabId: number, level: "warning" | "danger"): void {
 
       const isDanger = riskLevel === "danger";
       const bg = isDanger ? "#dc2626" : "#d97706";
-      // Plain-English messages for non-technical users
-      const msg = isDanger
-        ? "🚨 This looks like a fake website trying to steal your information. Close this tab now."
-        : "⚠️ This website might be trying to steal your password. Don't type anything here.";
+      const pct = riskScore > 0 ? ` (${Math.round(riskScore * 100)}% confidence)` : "";
+      const headline = isDanger
+        ? `🚨 Dangerous site detected${pct} — close this tab immediately.`
+        : `⚠️ Suspicious site detected${pct} — don't enter personal information.`;
+
+      const threatHTML = threatList.length
+        ? `<div style="margin-top:6px;font-size:11px;opacity:.9;">
+            ${threatList.map(t => `<span style="background:rgba(0,0,0,.25);padding:2px 7px;border-radius:10px;margin-right:4px;">${t}</span>`).join("")}
+           </div>`
+        : "";
 
       shadow.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;
+        <div style="display:flex;flex-direction:column;
           background:${bg};color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
           font-size:13px;font-weight:700;padding:10px 16px;box-shadow:0 2px 8px rgba(0,0,0,.4);
           pointer-events:all;box-sizing:border-box;width:100%;">
-          <span>${msg}</span>
-          <button id="dismiss" style="background:rgba(255,255,255,.2);border:2px solid rgba(255,255,255,.6);
-            color:#fff;font-size:12px;font-weight:700;padding:4px 12px;cursor:pointer;border-radius:4px;
-            flex-shrink:0;margin-left:12px;">Dismiss</button>
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <div style="flex:1">
+              <div>${headline}</div>
+              ${threatHTML}
+            </div>
+            <button id="dismiss" style="background:rgba(255,255,255,.2);border:2px solid rgba(255,255,255,.6);
+              color:#fff;font-size:12px;font-weight:700;padding:4px 12px;cursor:pointer;border-radius:4px;
+              flex-shrink:0;margin-left:12px;">Dismiss</button>
+          </div>
         </div>`;
 
       shadow.getElementById("dismiss")?.addEventListener("click", () => {
@@ -157,7 +179,7 @@ function injectBanner(tabId: number, level: "warning" | "danger"): void {
         } catch {}
       });
     },
-    args: [level],
+    args: [level, score, threats],
   }).catch(() => {});
 }
 
@@ -230,8 +252,6 @@ async function queryBackend(url: string, backendUrl: string): Promise<MLResult |
 
 // ---------------------------------------------------------------------------
 // ML: Offscreen Transformers.js (optional)
-// FIX: creatingOffscreen reset now happens in ensureOffscreen's catch, not
-// in queryOffscreenML's catch, so a failed creation doesn't leave a broken lock.
 // ---------------------------------------------------------------------------
 let creatingOffscreen: Promise<void> | null = null;
 
@@ -243,14 +263,15 @@ async function ensureOffscreen(): Promise<void> {
     reasons: ["WORKERS"],
     justification: "ML inference with Transformers.js",
   }).then(() => {
-    creatingOffscreen = null;  // Success: reset lock
+    creatingOffscreen = null;
   }).catch((err) => {
-    creatingOffscreen = null;  // Failure: reset lock so next call can retry
+    creatingOffscreen = null;
     throw err;
   });
   await creatingOffscreen;
 }
 
+// URL-only quick scan (Layer 1A)
 async function queryOffscreenML(url: string): Promise<MLResult | null> {
   try {
     await ensureOffscreen();
@@ -261,6 +282,63 @@ async function queryOffscreenML(url: string): Promise<MLResult | null> {
     return null;
   }
 }
+
+// Combined content scan (Layers 1A + 1B + 1C) with 5s timeout
+async function queryOffscreenContent(
+  url: string,
+  text: string
+): Promise<{ level: RiskLevel; score: number; urlScore: number; contentScore: number; provider: string } | null> {
+  try {
+    await ensureOffscreen();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const result = await Promise.race([
+      chrome.runtime.sendMessage({ type: "analyzeContent", url, text }),
+      new Promise<null>((_res, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+    ]) as {
+      level: RiskLevel; score: number; urlScore?: number; contentScore?: number; modelVersion?: string
+    } | null;
+    clearTimeout(timeout);
+    if (!result) return null;
+    return {
+      level: result.level,
+      score: result.score,
+      urlScore: result.urlScore ?? result.score,
+      contentScore: result.contentScore ?? result.score,
+      provider: result.modelVersion ?? "Transformers.js (combined)",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inference Queue — per-tab, max 1 in-flight, 500ms debounce
+// Prevents WASM OOM from concurrent inference calls.
+// ---------------------------------------------------------------------------
+class InferenceQueue {
+  private inFlight = new Set<number>();
+  private timers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  /** Schedule an inference for tabId with debounce. */
+  schedule(tabId: number, fn: () => Promise<void>, debounceMs = 500): void {
+    const existing = this.timers.get(tabId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.timers.delete(tabId);
+      if (this.inFlight.has(tabId)) return; // skip if already running for this tab
+      this.inFlight.add(tabId);
+      fn().catch(() => {}).finally(() => this.inFlight.delete(tabId));
+    }, debounceMs);
+    this.timers.set(tabId, timer);
+  }
+
+  isActive(tabId: number): boolean {
+    return this.inFlight.has(tabId) || this.timers.has(tabId);
+  }
+}
+
+const inferenceQueue = new InferenceQueue();
 
 // ---------------------------------------------------------------------------
 // Settings helpers
@@ -331,18 +409,57 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
     patterns = cached.patterns;
   }
 
-  // ── 4. Update passive indicators ─────────────────────────────────────────
+  // ── 4. Update passive indicators immediately (heuristic result) ──────────
+  const heuristicThreats = patterns.map(p => p.replace(/_/g, " "));
   saveRiskLevel(finalLevel);
   if (tabId !== undefined) {
     setBadge(tabId, finalLevel);
-    if (finalLevel !== "safe") injectBanner(tabId, finalLevel);
+    if (finalLevel !== "safe") injectBanner(tabId, finalLevel, 0, heuristicThreats);
+  }
+  broadcast({ type: "riskUpdate", level: finalLevel });
+  broadcast({ type: "mlRiskResult", level: finalLevel, mlScore: null, modelVersion: "Heuristic+URL", threats: heuristicThreats });
+  broadcast({ type: "threatUpdate", threats: heuristicThreats, level: finalLevel });
+
+  // ── 5. Schedule Layers 1B+1C combined content scan (queued, non-blocking) ─
+  if (tabId !== undefined) {
+    getBackendSettings().then(settings => {
+      if (!settings.enabled) return;
+      inferenceQueue.schedule(tabId!, async () => {
+        broadcast({ type: "mlScanStart", tabId });
+        const contentResult = await queryOffscreenContent(url, "").catch(() => null);
+        broadcast({ type: "mlScanDone", tabId });
+        if (!contentResult) return;
+
+        const combinedLevel: RiskLevel =
+          contentResult.level === "danger" || finalLevel === "danger" ? "danger"
+          : contentResult.level === "warning" || finalLevel === "warning" ? "warning"
+          : "safe";
+
+        const mlThreats: string[] = [...heuristicThreats];
+        if (contentResult.urlScore >= 0.55) mlThreats.push(`Phishing URL (${Math.round(contentResult.urlScore * 100)}%)`);
+        if (contentResult.contentScore >= 0.55) mlThreats.push(`Deceptive Content (${Math.round(contentResult.contentScore * 100)}%)`);
+
+        saveRiskLevel(combinedLevel);
+        setBadge(tabId!, combinedLevel);
+        if (combinedLevel !== "safe") injectBanner(tabId!, combinedLevel, contentResult.score, mlThreats);
+        broadcast({ type: "riskUpdate", level: combinedLevel });
+        broadcast({
+          type: "mlRiskResult",
+          level: combinedLevel,
+          mlScore: contentResult.score,
+          mlScorePct: Math.round(contentResult.score * 100),
+          urlScore: contentResult.urlScore,
+          contentScore: contentResult.contentScore,
+          modelVersion: contentResult.provider,
+          threats: mlThreats,
+        });
+        broadcast({ type: "threatUpdate", threats: mlThreats, level: combinedLevel });
+        console.info(`[AI Hygiene] Combined: ${combinedLevel} (${Math.round(contentResult.score * 100)}%) | ${contentResult.provider}`);
+      });
+    });
   }
 
-  broadcast({ type: "riskUpdate", level: finalLevel });
-  broadcast({ type: "mlRiskResult", level: finalLevel, mlScore: null, modelVersion: "Heuristic" });
-
-  // ── 5. XP awards / penalties — deduped per URL ───────────────────────────
-  // FIX: check dedup BEFORE awarding, for both safe AND danger.
+  // ── 6. XP awards / penalties — deduped per URL ───────────────────────────
   try {
     const alreadyAwarded = await hasAwardedXpForUrl(url);
     if (alreadyAwarded) return;
@@ -352,12 +469,10 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
     if (finalLevel === "danger") {
       if (tabId !== undefined) await markTabAsDanger(tabId);
 
-      const prevLevel = (await loadStats()).level;
       const { stats, newBadges } = await updateStats(s => applyDanger(s));
       await saveRiskEvent({ url, riskLevel: finalLevel, detectedPatterns: patterns, timestamp: Date.now(), xpChange: -XP.DANGER_PENALTY });
       await notifyXpChange(stats, -XP.DANGER_PENALTY, "Landed on a dangerous site 🚨");
       if (newBadges.length) await notifyNewBadges(newBadges, stats);
-      if (stats.level < prevLevel) { /* de-level handled by XP floor at 0 */ }
     } else {
       const prevLevel = (await loadStats()).level;
       const { stats, newBadges } = await updateStats(s => applySafeBrowse(s, finalLevel));
@@ -495,6 +610,21 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       });
     }
 
+    // PII scan — if a password/email field is detected on a non-safe page, run PII detection
+    // This is fire-and-forget (non-blocking for the response)
+    if (signals.hasPasswordField && pageText && contentAnalysis.level !== "safe") {
+      queryOffscreenForPii(pageText).then((piiResult) => {
+        if (piiResult?.hasPii) {
+          broadcast({
+            type: "piiDetected",
+            entities: piiResult.entities,
+            confidence: piiResult.confidence,
+          });
+          console.warn("[AI Hygiene] PII detected in form field context:", piiResult.entities);
+        }
+      }).catch(() => {});
+    }
+
     sendResponse({ ok: true });
     return true;
   }
@@ -562,6 +692,44 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
+  // ── Model status (query from Settings UI) ────────────────────────────────
+  if (message.type === "getModelStatus") {
+    // First try to get live status from the offscreen doc
+    ensureOffscreen()
+      .then(() => chrome.runtime.sendMessage({ type: "getModelStatus" }))
+      .then((res) => sendResponse(res))
+      .catch(async () => {
+        // Fallback: read from storage
+        const stored = await chrome.storage.local.get([MODEL_STATUS_STORAGE_KEY]);
+        const statusMap: ModelStatusMap = stored[MODEL_STATUS_STORAGE_KEY] ?? defaultModelStatusMap();
+        sendResponse({ statusMap });
+      });
+    return true;
+  }
+
+  // ── Trigger model download sequence ──────────────────────────────────────
+  if (message.type === "downloadModels") {
+    ensureOffscreen()
+      .then(() => chrome.runtime.sendMessage({ type: "downloadModels" }))
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // ── Relay modelProgress from offscreen → popup ────────────────────────────
+  // (Offscreen sends this; background relays to popup since offscreen can't
+  //  directly reach popup UI windows.)
+  if (message.type === "modelProgress") {
+    broadcast(message);
+    return false; // no async response needed
+  }
+
+  // ── Relay modelStatusUpdate from offscreen → popup ────────────────────────
+  if (message.type === "modelStatusUpdate") {
+    broadcast(message);
+    return false;
+  }
+
   // ── Daemon manager (heavy model / Ollama) ─────────────────────────────────
   if (message.type === "detectRuntime") {
     detectAvailableRuntime().then(runtime => sendResponse(runtime));
@@ -580,6 +748,65 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       broadcast({ type: "modelPullProgress", percent: pct });
     }).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
+  }
+
+  // ── domMutationScan (from content script MutationObserver) ──────────────
+  // Dynamic text added to the page — queue a lightweight content scan.
+  if (message.type === "domMutationScan") {
+    const { url, text } = message as { url: string; text: string };
+    const tabId = sender.tab?.id;
+    if (tabId !== undefined && url && text) {
+      getBackendSettings().then(settings => {
+        if (!settings.enabled) return;
+        inferenceQueue.schedule(tabId, async () => {
+          const result = await queryOffscreenContent(url, text).catch(() => null);
+          if (!result || result.level === "safe") return;
+          // Only escalate — never downgrade an existing warning/danger
+          loadRiskLevel().then(currentLevel => {
+            const escalated: RiskLevel =
+              result.level === "danger" || currentLevel === "danger" ? "danger"
+              : "warning";
+            saveRiskLevel(escalated);
+            setBadge(tabId, escalated);
+            const mutationThreats = result.contentScore >= 0.55
+              ? [`Deceptive Language (${Math.round(result.contentScore * 100)}%)`]
+              : ["Suspicious Dynamic Content"];
+            injectBanner(tabId, escalated, result.score, mutationThreats);
+            broadcast({ type: "riskUpdate", level: escalated });
+            broadcast({ type: "threatUpdate", threats: mutationThreats, level: escalated });
+          });
+        }, 1500); // longer debounce for mutations (less urgent than navigation)
+      });
+    }
+    return false;
+  }
+
+  // ── piiInputScan (from content script field monitor) ─────────────────────
+  // User typed into a sensitive field — run PII detection.
+  if (message.type === "piiInputScan") {
+    const { text, fieldId } = message as { text: string; fieldId: string; url: string };
+    const tabId = sender.tab?.id;
+    if (tabId !== undefined && text) {
+      queryOffscreenForPii(text).then(piiResult => {
+        if (!piiResult?.hasPii) return;
+        // Send piiFieldWarning back to the specific tab's content script
+        chrome.tabs.sendMessage(tabId, {
+          type: "piiFieldWarning",
+          fieldId,
+          entities: piiResult.entities,
+          confidence: piiResult.confidence,
+        }).catch(() => {});
+        // Also broadcast to popup for the threat list
+        broadcast({
+          type: "piiDetected",
+          fieldId,
+          entities: piiResult.entities,
+          confidence: piiResult.confidence,
+        });
+        console.warn("[AI Hygiene] PII in form input:", piiResult.entities, "field:", fieldId);
+      }).catch(() => {});
+    }
+    return false;
   }
 
   return false;
@@ -671,6 +898,30 @@ async function pullModelWithProgress(model: string, onProgress: (pct: number) =>
 }
 
 // ---------------------------------------------------------------------------
+// PII query helper (offscreen)
+// ---------------------------------------------------------------------------
+async function queryOffscreenForPii(text: string): Promise<{ hasPii: boolean; entities: string[]; confidence: number } | null> {
+  try {
+    await ensureOffscreen();
+    const result = await chrome.runtime.sendMessage({ type: "scanPii", text });
+    return result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ensure offscreen + trigger model downloads
+// ---------------------------------------------------------------------------
+async function ensureOffscreenAndDownload(): Promise<void> {
+  try {
+    await ensureOffscreen();
+    // Fire-and-forget — we don't need to await completion
+    chrome.runtime.sendMessage({ type: "downloadModels" }).catch(() => {});
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 chrome.runtime.onInstalled.addListener(async () => {
@@ -684,4 +935,15 @@ chrome.runtime.onInstalled.addListener(async () => {
     "AI Hygiene Companion Activated 🛡️",
     "Ready to help you browse safely and earn XP!"
   ).catch(() => {});
+
+  // Begin downloading ML models in background (first run)
+  ensureOffscreenAndDownload();
+});
+
+// ---------------------------------------------------------------------------
+// Startup (subsequent browser starts)
+// ---------------------------------------------------------------------------
+chrome.runtime.onStartup.addListener(() => {
+  // Re-initialize offscreen and resume any incomplete downloads
+  ensureOffscreenAndDownload();
 });
