@@ -13,6 +13,10 @@ export default defineConfig({
                     src: 'node_modules/@huggingface/transformers/dist/*.jsep.wasm',
                     dest: 'assets',
                 },
+                {
+                    src: 'node_modules/@huggingface/transformers/dist/*.jsep.mjs',
+                    dest: 'assets',
+                },
             ],
         }),
     ],

@@ -1,0 +1,9 @@
+{
+  "name": "com.ai_hygiene",
+  "description": "AI Hygiene Companion Native Host",
+  "path": "C:\\\\Users\\\\Admin\\\\Documents\\\\GitHub\\\\ai-hygiene-extension\\\\api\\\\host.cmd",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://nkbenlapinplbagpmdnenikgpkoibbei/"
+  ]
+}

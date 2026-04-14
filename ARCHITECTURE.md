@@ -1,6 +1,6 @@
 # Architecture
 
-This document is the definitive technical reference for the AI Hygiene Companion's internal architecture. It covers the Chrome Manifest V3 constraints, the dual-layer AI pipeline, message passing, state management, and gamification engine.
+This document is the technical reference for the AI Hygiene Companion's current standalone architecture. It covers MV3 constraints, the offscreen model runtime, message flow, scanner simulation page, state management, and gamification.
 
 ---
 
@@ -9,8 +9,8 @@ This document is the definitive technical reference for the AI Hygiene Companion
 - [Overview](#overview)
 - [Manifest V3 Constraints](#manifest-v3-constraints)
 - [System Topology](#system-topology)
-- [Layer 1 — Lightweight ML Engine](#layer-1--lightweight-ml-engine-zero-config)
-- [Layer 2 — Heavyweight NPU Engine](#layer-2--heavyweight-npu-engine-opt-in)
+- [Layer 1 — Lightweight ML Engine](#layer-1--lightweight-detection-engine-default)
+- [Layer 2 — Scanner Simulation](#layer-2--scanner-simulation-ui-debug)
 - [Message Passing Protocol](#message-passing-protocol)
 - [State Management & Mutex](#state-management--mutex)
 - [XP & Gamification Pipeline](#xp--gamification-pipeline)
@@ -22,9 +22,17 @@ This document is the definitive technical reference for the AI Hygiene Companion
 
 ## Overview
 
-The extension is built around a **split-compute** philosophy: fast, zero-config local inference handles the common case (the vast majority of URLs are safe), while an opt-in local NPU daemon handles deep de-obfuscation tasks that cannot be solved by lightweight encoders.
+The extension is built around a **standalone offscreen** philosophy: fast local inference handles URL/content/PII checks directly in-browser, while the scanner page provides deterministic staged simulation for product UX and debugging.
 
 All analysis is on-device. No browsing data leaves the machine.
+
+Current startup flow:
+
+1. Service worker creates/ensures offscreen document.
+2. Offscreen runtime initializes Transformers.js WASM with extension-local ORT assets.
+3. Lightweight models download sequentially and publish progress/status events.
+4. Popup/Settings render live model lifecycle (`idle/downloading/ready/failed`).
+5. Risk decisions use fused scoring (heuristics + model confidence) with strict thresholds to avoid random flags.
 
 ---
 
@@ -75,78 +83,46 @@ Chrome's Manifest V3 introduces three constraints that shape the entire architec
 
 ---
 
-## Layer 1 — Lightweight ML Engine (Zero Config)
+## Layer 1 — Lightweight Detection Engine (Default)
 
 ### Model
 
-`pirocheto/phishing-url-detection` — a lightweight ONNX model (~8 MB quantised) trained specifically for URL-based phishing classification.
+Primary path uses offscreen Transformers.js models loaded in `src/offscreen.ts`.
 
-- **Input:** Raw URL string
-- **Output:** `{ label: "phishing" | "legitimate", score: 0.0–1.0 }`
-- **Latency:** ~20–80ms on WASM, <10ms on WebGPU
+- **Input:** URL and/or page text
+- **Output:** `{ level, score, urlScore, contentScore, modelVersion }`
+- **Latency:** model readiness updates as sequential downloads complete
 
 ### Execution Environment
 
-The model runs inside the **Offscreen Document** (`src/offscreen.ts`). This is a hidden browser page that:
-- Has full DOM access (unlike the Service Worker)
-- Supports WebAssembly and WebGPU
-- Persists for the duration of the browser session
+- **Primary:** Offscreen document (`src/offscreen.ts`) for in-browser inference
+- **Runtime:** ONNX Runtime Web (WASM assets bundled into extension)
 
 ### Inference Pipeline
 
-```
-background.ts
-  └── analyzeUrlWithOffscreenML(url)
-        └── chrome.runtime.sendMessage({ type: "analyzeUrl", url })
-              └── offscreen.ts :: analyzeUrl(url)
-                    └── classifier(url)   ← Transformers.js pipeline
-                          └── ONNX Runtime (WASM / WebGPU)
-```
+`background.ts` runs heuristics first, then offscreen model inference, and applies strict confidence thresholds before escalating to warning/danger.
 
 ### Model Caching
 
-Model weights are fetched from HuggingFace on first use and cached in the browser's **IndexedDB** by Transformers.js automatically. Subsequent loads use the cached weights — no network request needed.
+Model artifacts are downloaded/cached via Transformers.js browser cache; inference remains fully local after weights are available.
 
 ### Domain-Level Analysis Caching
 
-To avoid redundant ML inference, `background.ts` tracks which domains have been analyzed this session in `chrome.storage.session` under `mlAnalyzedDomains`. The model runs once per domain per session. XP awarding is separate and runs per URL.
+To avoid redundant inference bursts, `background.ts` maintains a short-lived in-memory domain cache plus a per-tab inference queue/debounce.
 
 ---
 
-## Layer 2 — Heavyweight NPU Engine (Opt-In)
+## Layer 2 — Scanner Simulation (UI/Debug)
 
-When the user enables "Heavyweight Local NPU Daemon" in Settings, the extension routes high-complexity requests to a locally running LLM server.
+`src/popup/pages/ScannerPage.tsx` implements a deterministic simulator that mirrors an AMD NPU-style staged pipeline:
 
-### Supported Runtimes
+1. URL parse
+2. Reddit scan
+3. Quora scan
+4. NPU infer
+5. Score fuse
 
-| Runtime | URL | Models |
-|---|---|---|
-| AMD GAIA | `http://127.0.0.1:8000` | Llama 3.2 (1B/3B), DeepSeek-R1 Distill |
-| Lemonade Server | `http://127.0.0.1:11434` | Llama 3.2, Qwen 2.5 Coder |
-| LM Studio | `http://127.0.0.1:1234` | Any OpenAI-compatible model |
-
-### Security Constraint
-
-The backend URL is validated to only accept `127.0.0.1` or `localhost` origins. No external API endpoints are allowed. This is enforced in `Settings.tsx` and `background.ts`.
-
-### Request Format
-
-```
-POST /analyze/url
-Content-Type: application/json
-
-{ "url": "https://susp1cious-site.tk/login" }
-```
-
-### Response Format
-
-```json
-{
-  "phishing_score": 0.92,
-  "provider": "Llama 3.2 (XDNA NPU)",
-  "reasoning": "..."
-}
-```
+This page is currently simulation-driven (hardcoded scenarios) and is intentionally separate from runtime risk enforcement.
 
 ---
 
@@ -156,8 +132,10 @@ All cross-context communication uses `chrome.runtime.sendMessage`. The full mess
 
 | Type | Direction | Payload | Response |
 |---|---|---|---|
+| `offscreen.downloadModels` | SW → Offscreen | — | `{ ok, error? }` |
+| `offscreen.getModelStatus` | SW → Offscreen | — | `{ statusMap }` |
+| `offscreen.dismissModelPrompt` | SW → Offscreen | — | `{ ok }` |
 | `analyzeUrl` | SW → Offscreen | `{ url }` | `{ level, score, modelVersion }` |
-| `initML` | SW → Offscreen | — | `{ ok, model }` |
 | `pageScanResult` | Content → SW | `{ url, signals }` | `{ received }` |
 | `getRiskLevel` | Popup → SW | — | `{ level }` |
 | `getStats` | Popup → SW | — | `{ stats }` |
@@ -170,6 +148,8 @@ All cross-context communication uses `chrome.runtime.sendMessage`. The full mess
 | `dismissWarning` | Content → SW | — | — |
 | `panicInitiated` | Popup → SW | — | `{ stats }` |
 | `recoveryCompleted` | Popup → SW | — | `{ stats }` |
+| `getModelStatus` | Popup → SW | — | `{ statusMap, error? }` |
+| `downloadModels` | Popup → SW | — | `{ ok, error? }` |
 | `getSettings` | Popup → SW | — | `{ backend, notifications }` |
 | `saveSettings` | Popup → SW | `{ backend, notifications }` | `{ success }` |
 
@@ -177,7 +157,9 @@ All cross-context communication uses `chrome.runtime.sendMessage`. The full mess
 
 ## State Management & Mutex
 
-All persistent state lives in `chrome.storage.local`. Session-scoped state (XP deduplication, ML domain cache, toast cooldown) lives in `chrome.storage.session` which clears when the browser closes.
+All persistent state lives in `chrome.storage.local` when available. Session-scoped state (XP deduplication, danger tabs, toast cooldown) lives in `chrome.storage.session`.
+
+Offscreen storage calls are guarded to prevent runtime crashes when `chrome.storage.local` is temporarily unavailable.
 
 ### The Stats Mutex
 

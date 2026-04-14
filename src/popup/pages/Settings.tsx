@@ -1,14 +1,7 @@
-// src/popup/pages/Settings.tsx
-// Settings page — backend configuration and notification preferences.
+import { useState, useEffect } from "react";
+import { MODELS, defaultModelStatusMap, type ModelKey, type ModelStatusMap } from "../../lib/model-registry";
 
-import { useState, useEffect, useCallback } from "react";
-import { DEFAULT_BACKEND_URL } from "../../lib/constants";
-
-interface BackendSettings {
-  enabled: boolean;
-  useLocalBackend: boolean;
-  backendUrl: string;
-}
+interface BackendSettings { enabled: boolean; useLocalBackend: boolean; backendUrl: string; }
 
 interface NotificationSettings {
   xpGainEnabled: boolean;
@@ -25,7 +18,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [backend, setBackend] = useState<BackendSettings>({
     enabled: true,
     useLocalBackend: false,
-    backendUrl: DEFAULT_BACKEND_URL,
+    backendUrl: "http://127.0.0.1:8000",
   });
 
   const [notifications, setNotifications] = useState<NotificationSettings>({
@@ -35,43 +28,48 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     dangerAlertEnabled: true,
   });
 
-  const [backendStatus, setBackendStatus] = useState<"unknown" | "running" | "offline">("unknown");
-  const [urlError, setUrlError] = useState<string | null>(null);
+  const [modelStatus, setModelStatus] = useState<ModelStatusMap>(defaultModelStatusMap());
+  const [modelStatusError, setModelStatusError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const isValidUrl = (url: string): boolean => {
-    if (!url) return true;
-    try {
-      const p = new URL(url);
-      return p.hostname === "127.0.0.1" || p.hostname === "localhost";
-    } catch { return false; }
-  };
-
-  const loadSettings = useCallback(async () => {
+  // Load settings from background
+  const loadSettings = async () => {
     try {
       const res = await chrome.runtime.sendMessage({ type: "getSettings" });
       if (res?.backend) setBackend(res.backend);
       if (res?.notifications) setNotifications(res.notifications);
     } catch {}
-  }, []);
+  };
 
-  const checkStatus = useCallback(async () => {
+  const loadModelStatus = async () => {
     try {
-      const res = await fetch(`${backend.backendUrl}/health`, {
-        method: "GET",
-        signal: AbortSignal.timeout(2000),
-      });
-      setBackendStatus(res.ok ? "running" : "offline");
-    } catch {
-      setBackendStatus("offline");
-    }
-  }, [backend.backendUrl]);
+      const res = await chrome.runtime.sendMessage({ type: "getModelStatus" });
+      if (res?.statusMap) setModelStatus(res.statusMap as ModelStatusMap);
+      setModelStatusError(typeof res?.error === "string" ? res.error : null);
+    } catch {}
+  };
 
   useEffect(() => {
     loadSettings();
-    checkStatus();
-  }, [loadSettings, checkStatus]);
+    loadModelStatus();
+    const handler = (msg: Record<string, unknown>) => {
+      if (msg.type === "modelStatusUpdate" && msg.statusMap) {
+        setModelStatus(msg.statusMap as ModelStatusMap);
+        setDownloading(false);
+      }
+      if (msg.type === "modelProgress" && typeof msg.key === "string" && typeof msg.progress === "number") {
+        const key = msg.key as ModelKey;
+        setModelStatus((prev) => ({
+          ...prev,
+          [key]: { ...prev[key], state: "downloading", progress: msg.progress },
+        }));
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    return () => chrome.runtime.onMessage.removeListener(handler);
+  }, []);
 
   async function handleSave() {
     setSaving(true);
@@ -86,28 +84,25 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     }
   }
 
-  async function handleTestConnection() {
+  async function handleDownloadModels() {
+    setDownloading(true);
+    setModelStatusError(null);
     try {
-      const res = await fetch(`${backend.backendUrl}/health`, {
-        method: "GET",
-        signal: AbortSignal.timeout(3000),
-      });
-      alert(res.ok ? "✅ Connected to local daemon!" : "❌ Backend responded with an error.");
+      const res = await chrome.runtime.sendMessage({ type: "downloadModels" });
+      if (!res?.ok) {
+        if (typeof res?.error === "string") {
+          setModelStatusError(res.error);
+        } else {
+          setModelStatusError("Model download request failed.");
+        }
+        setDownloading(false);
+      }
+      setTimeout(loadModelStatus, 1000);
     } catch {
-      alert(`❌ Cannot reach ${backend.backendUrl}. Make sure the backend is running.`);
+      setModelStatusError("Failed to send model download request.");
+      setDownloading(false);
     }
   }
-
-  const statusColors = {
-    running: "bg-green-100 text-green-800",
-    offline: "bg-red-100 text-red-800",
-    unknown: "bg-gray-100 text-gray-600",
-  };
-  const statusText = {
-    running: "● Connected",
-    offline: "● Offline",
-    unknown: "● Checking…",
-  };
 
   return (
     <div className="w-[380px] min-h-[600px] bg-background border-4 border-border flex flex-col font-mono text-foreground">
@@ -126,58 +121,52 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-6 bg-[#f8f9fa]">
 
-        {/* ── Built-in ML ─────────────────────────────────────────────────── */}
-        <Section title="Built-In Browser ML (Transformers.js)">
-          <ToggleRow
-            id="toggle-browser-ml"
-            label="Enable In-Browser URL Analysis"
-            description="Uses pirocheto/phishing-url-detection ONNX model locally. Zero config, fully private."
-            checked={backend.enabled}
-            onChange={(v) => setBackend(s => ({ ...s, enabled: v }))}
-          />
-          <p className="text-xs text-muted-foreground mt-1 font-mono">
-            ℹ️ Only flags sites when phishing confidence ≥ 55%. Everyday sites like Google, YouTube, etc. are never flagged.
+        <Section title="Standalone Models">
+          <p className="text-xs text-muted-foreground">
+            Models download automatically on extension load. Retry download if any model is failed/idle.
           </p>
+          {modelStatusError && (
+            <div className="text-[10px] border border-red-500 bg-red-50 text-red-700 p-2">
+              {modelStatusError}
+            </div>
+          )}
+          <div className="space-y-2">
+            {(Object.keys(MODELS) as ModelKey[]).map((key) => {
+              const s = modelStatus[key];
+              return (
+                <div key={key} className="text-xs border border-border p-2 bg-white">
+                  <div className="flex items-center justify-between">
+                    <span>{MODELS[key].nickname}</span>
+                    <span className={s.state === "ready" ? "text-emerald-700" : s.state === "failed" ? "text-red-700" : "text-amber-700"}>
+                      {s.state}
+                    </span>
+                  </div>
+                  {(s.state === "downloading" || s.progress > 0) && (
+                    <div className="mt-1 text-[10px] text-muted-foreground">Progress: {s.progress}%</div>
+                  )}
+                  {s.error && <div className="mt-1 text-[10px] text-red-700 break-words">{s.error}</div>}
+                </div>
+              );
+            })}
+          </div>
+          <button
+            id="settings-download-models-btn"
+            onClick={handleDownloadModels}
+            disabled={downloading}
+            className="text-xs px-3 py-1.5 border-2 border-border bg-foreground text-background font-mono hover:opacity-80 transition-opacity disabled:opacity-60"
+          >
+            {downloading ? "Downloading..." : "Download / Retry Models"}
+          </button>
         </Section>
 
-        {/* ── Local NPU Daemon ────────────────────────────────────────────── */}
-        <Section title="Local NPU Daemon (Advanced)">
+        <Section title="Scan Behavior">
           <ToggleRow
-            id="toggle-npu-backend"
-            label="Enable Local FastAPI Backend"
-            description="Routes analysis to a locally-running backend (e.g. Lemonade Server with AMD NPU)."
-            checked={backend.useLocalBackend}
-            onChange={(v) => setBackend(s => ({ ...s, useLocalBackend: v }))}
+            id="toggle-standalone-ml"
+            label="Enable On-Device AI Scanning"
+            description="Uses offscreen models only. No backend required."
+            checked={backend.enabled}
+            onChange={(v) => setBackend((s) => ({ ...s, enabled: v, useLocalBackend: false }))}
           />
-
-          <div>
-            <label className="text-xs font-medium text-foreground">API URL</label>
-            <input
-              type="text"
-              value={backend.backendUrl}
-              onChange={(e) => {
-                const v = e.target.value;
-                setUrlError(isValidUrl(v) ? null : "Only 127.0.0.1 or localhost allowed.");
-                setBackend(s => ({ ...s, backendUrl: v }));
-              }}
-              className={`mt-1 w-full px-3 py-2 border-2 text-xs bg-white font-mono ${urlError ? "border-red-500" : "border-border"}`}
-              placeholder={DEFAULT_BACKEND_URL}
-            />
-            {urlError && <p className="text-xs text-red-600 mt-1">{urlError}</p>}
-          </div>
-
-          <div className="flex items-center gap-3 mt-1">
-            <button
-              id="settings-test-connection-btn"
-              onClick={handleTestConnection}
-              className="text-xs px-3 py-1.5 border-2 border-border bg-white hover:bg-accent transition-colors font-mono"
-            >
-              Test Connection
-            </button>
-            <span className={`text-xs font-medium px-2 py-0.5 rounded ${statusColors[backendStatus]}`}>
-              {statusText[backendStatus]}
-            </span>
-          </div>
         </Section>
 
         {/* ── Notifications ───────────────────────────────────────────────── */}
@@ -194,7 +183,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         <button
           id="settings-save-btn"
           onClick={handleSave}
-          disabled={saving || !!urlError}
+          disabled={saving}
           className="w-full bg-foreground text-background border-2 border-border px-4 py-3 text-sm font-bold font-['Syne'] hover:opacity-80 transition-opacity disabled:opacity-50"
         >
           {saving ? "Saving…" : saved ? "✅ Saved!" : "Save Settings"}
@@ -204,8 +193,9 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   );
 }
 
-// ── Helper components ────────────────────────────────────────────────────────
-
+// ---------------------------------------------------------------------------
+// Helper components
+// ---------------------------------------------------------------------------
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="space-y-3">

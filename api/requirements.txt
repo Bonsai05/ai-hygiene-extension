@@ -1,3 +1,7 @@
 fastapi>=0.100
 uvicorn[standard]>=0.20
 pydantic>=2.0
+transformers>=4.40
+torch>=2.1
+optimum[onnxruntime]>=1.18
+onnxruntime-directml>=1.17

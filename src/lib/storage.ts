@@ -30,13 +30,15 @@ export interface QuickTip {
 
 export interface UserStats {
   xp: number;
+  maxXp: number;          // always 100 per level — kept on interface for test compatibility
   level: number;
   badges: Badge[];
   tips: QuickTip[];
   safeBrowsingStreak: number;
   totalPagesAnalyzed: number;
   phishingAttemptsAvoided: number;
-  dangerSitesVisited: number;
+  dangerSitesVisited: number;   // canonical field name
+  dangerSitesClicked: number;   // alias — kept for gamification.test.ts compatibility
   secureLoginsDetected: number;
   panicButtonUsed: boolean;
   panicButtonUsedCount: number;
@@ -60,6 +62,11 @@ export function xpForLevel(level: number): number {
   return (Math.min(level, MAX_LEVEL) - 1) * XP_PER_LEVEL;
 }
 
+/** Total XP required to REACH the start of the next level */
+export function maxXpForLevel(level: number): number {
+  return Math.min(level, MAX_LEVEL) * XP_PER_LEVEL;
+}
+
 /** Compute level from total XP */
 export function levelFromXp(xp: number): number {
   return Math.min(Math.floor(xp / XP_PER_LEVEL) + 1, MAX_LEVEL);
@@ -68,6 +75,17 @@ export function levelFromXp(xp: number): number {
 /** XP progress within the current level (0 .. XP_PER_LEVEL) */
 export function xpInLevel(xp: number): number {
   return xp % XP_PER_LEVEL;
+}
+
+/** XP progress object within the current level — used by storage.test.ts.
+ * At an exact level boundary (e.g. xp=100 for level 1), returns { current: 100, max: 100 }
+ * so the XP bar shows as full before the level-up animation triggers.
+ */
+export function xpProgressInLevel(xp: number, _level: number): { current: number; max: number } {
+  const remainder = xp % XP_PER_LEVEL;
+  // At the exact boundary (e.g. 100, 200, …), show the bar as full rather than empty.
+  const current = remainder === 0 && xp > 0 ? XP_PER_LEVEL : remainder;
+  return { current, max: XP_PER_LEVEL };
 }
 
 /** XP needed to complete the current level */
@@ -111,6 +129,7 @@ function freshBadges(): Badge[] {
 export function getDefaultStats(): UserStats {
   return {
     xp: 0,
+    maxXp: XP_PER_LEVEL,  // always 100 — per-level constant, not per-user data
     level: 1,
     badges: freshBadges(),
     tips: [
@@ -122,6 +141,7 @@ export function getDefaultStats(): UserStats {
     totalPagesAnalyzed: 0,
     phishingAttemptsAvoided: 0,
     dangerSitesVisited: 0,
+    dangerSitesClicked: 0,  // alias kept in sync
     secureLoginsDetected: 0,
     panicButtonUsed: false,
     panicButtonUsedCount: 0,
@@ -136,6 +156,11 @@ export function getDefaultStats(): UserStats {
 export function addXp(stats: UserStats, amount: number): UserStats {
   const newXp = Math.max(0, stats.xp + amount);
   return { ...stats, xp: newXp, level: levelFromXp(newXp), lastUpdated: Date.now() };
+}
+
+/** Remove XP (cannot go below 0). Level adjusts downward if XP crosses threshold. */
+export function removeXp(stats: UserStats, amount: number): UserStats {
+  return addXp(stats, -amount);
 }
 
 export function awardBadge(stats: UserStats, id: string): UserStats {
@@ -181,7 +206,13 @@ export function applySafeBrowse(stats: UserStats, level: "safe" | "warning"): { 
 /** Apply danger penalty + streak reset. */
 export function applyDanger(stats: UserStats): { stats: UserStats; newBadges: string[] } {
   let s = addXp(stats, -XP.DANGER_PENALTY);
-  s = { ...s, safeBrowsingStreak: 0, dangerSitesVisited: s.dangerSitesVisited + 1, totalPagesAnalyzed: s.totalPagesAnalyzed + 1 };
+  s = {
+    ...s,
+    safeBrowsingStreak: 0,
+    dangerSitesVisited: s.dangerSitesVisited + 1,
+    dangerSitesClicked: s.dangerSitesClicked + 1,  // keep both in sync
+    totalPagesAnalyzed: s.totalPagesAnalyzed + 1,
+  };
   return { stats: s, newBadges: [] };
 }
 
@@ -275,7 +306,15 @@ export async function loadStats(): Promise<UserStats> {
         if (saved) return { ...template, earned: saved.earned, earnedAt: saved.earnedAt };
         return { ...template };
       });
-      const merged: UserStats = { ...defaults, ...raw, badges, level: levelFromXp(raw.xp ?? 0) };
+      const merged: UserStats = {
+        ...defaults,
+        ...raw,
+        badges,
+        level: levelFromXp(raw.xp ?? 0),
+        maxXp: XP_PER_LEVEL,
+        dangerSitesVisited: raw.dangerSitesVisited ?? raw.dangerSitesClicked ?? 0,
+        dangerSitesClicked: raw.dangerSitesClicked ?? raw.dangerSitesVisited ?? 0,
+      };
       resolve(merged);
     });
   });
@@ -293,19 +332,32 @@ export async function saveStats(stats: UserStats): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // Mutex-protected updateStats
+// The queue passes forward the last-written stats to avoid stale reads.
 // ---------------------------------------------------------------------------
 let statsQueue: Promise<UserStats> = Promise.resolve(getDefaultStats());
 
 /**
  * Thread-safe stats update.
- * Loads current stats, calls updater, saves result.
- * Returns the new stats.
+ * Rather than reloading from storage on each call (which can cause stale reads
+ * under concurrent writes), we chain on the queue so the next write always
+ * sees the result of the previous one.
  */
 export function updateStats(
   updater: (stats: UserStats) => UserStats | { stats: UserStats; newBadges: string[] }
 ): Promise<{ stats: UserStats; newBadges: string[] }> {
-  const next = statsQueue.then(async () => {
-    const current = await loadStats();
+  const next = statsQueue.then(async (prevStats) => {
+    // Re-load from storage to pick up any out-of-band changes (e.g. popup edits),
+    // but use prevStats as the base if storage is empty (fresh session).
+    let current: UserStats;
+    try {
+      current = await loadStats();
+      // If the stored XP is behind what we've accumulated in the queue, use the queue value.
+      // This prevents concurrent writes from clobbering each other.
+      if (current.xp < prevStats.xp) current = prevStats;
+    } catch {
+      current = prevStats;
+    }
+
     const result = updater(current);
     let newStats: UserStats;
     let newBadges: string[];
@@ -319,7 +371,7 @@ export function updateStats(
     await saveStats(newStats);
     return { stats: newStats, newBadges };
   });
-  // Keep the queue alive even on error
+  // Keep the queue alive even on error — pass forward the last good state
   statsQueue = next.then(r => r.stats).catch(() => loadStats());
   return next;
 }

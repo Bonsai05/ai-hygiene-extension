@@ -1,171 +1,285 @@
-// src/offscreen.ts
-// Offscreen Document — runs Transformers.js WASM for phishing URL classification.
-// MV3 service workers can't load WASM, so this offscreen doc handles ML inference.
-//
-// Model: pirocheto/phishing-url-detection
-// Labels: LABEL_0 = legitimate, LABEL_1 = phishing
-//
-// FIX: Previous version was randomly flagging sites because it treated any
-// low-confidence benign score as "warning". Now we ONLY flag as risky when
-// the PHISHING class score is HIGH. Benign = benign, regardless of confidence.
+import { pipeline, env, type TextClassificationPipeline, type TokenClassificationPipeline, type ProgressCallback } from "@huggingface/transformers";
+import { MODELS, MODEL_STATUS_STORAGE_KEY, defaultModelStatusMap, type ModelKey, type ModelState, type ModelStatusMap } from "./lib/model-registry";
 
-import { pipeline, env, type TextClassificationPipeline } from "@huggingface/transformers";
-
-const MODEL_ID = "pirocheto/phishing-url-detection";
 type RiskLevel = "safe" | "warning" | "danger";
+interface MLResult { level: RiskLevel; score: number; modelVersion: string; contentScore?: number; urlScore?: number; }
 
-interface MLResult {
-  level: RiskLevel;
-  score: number;      // Phishing probability 0–1
-  modelVersion: string;
+const DANGER_THRESHOLD = 0.86;
+const WARNING_THRESHOLD = 0.68;
+const DOWNLOAD_PROMPT_KEY = "modelDownloadPromptDismissed";
+const MODEL_LOAD_TIMEOUT_MS = 120000;
+
+let urlClassifier: TextClassificationPipeline | null = null;
+let contentClassifier: TextClassificationPipeline | null = null;
+let piiClassifier: TokenClassificationPipeline | null = null;
+let statusMap: ModelStatusMap = defaultModelStatusMap();
+let downloadSequenceRunning = false;
+
+function storageLocal(): chrome.storage.StorageArea | null {
+  return globalThis.chrome?.storage?.local ?? null;
 }
 
-// Thresholds: only flag as phishing when confidence is HIGH
-// This prevents false positives on everyday sites.
-const PHISHING_DANGER_THRESHOLD = 0.80;   // ≥80% phishing → danger
-const PHISHING_WARNING_THRESHOLD = 0.55;  // ≥55% phishing → warning
-// Below 55% phishing probability → treat as safe (model is uncertain → give benefit of doubt)
-
-let classifier: TextClassificationPipeline | null = null;
-let modelState: "idle" | "loading" | "ready" | "failed" = "idle";
-let pendingRequests: Array<(result: MLResult) => void> = [];
-
-function safeResult(): MLResult {
-  return { level: "safe", score: 0, modelVersion: MODEL_ID };
-}
-
-/**
- * Convert model output to risk level.
- * IMPORTANT: We look specifically at the PHISHING class score.
- * Never downgrade based on low benign confidence.
- */
-function scoreToLevel(label: string, score: number): MLResult {
-  const lc = label.toLowerCase();
-  const isPhishingClass =
-    lc.includes("phishing") ||
-    lc.includes("label_1") ||
-    lc.includes("bad") ||
-    lc.includes("malicious");
-
-  if (!isPhishingClass) {
-    // This is the BENIGN score — ignore for risk purposes
-    // Compute phishing prob as 1 - benign prob for completeness
-    const phishingProb = 1 - score;
-    if (phishingProb >= PHISHING_DANGER_THRESHOLD) return { level: "danger", score: phishingProb, modelVersion: MODEL_ID };
-    if (phishingProb >= PHISHING_WARNING_THRESHOLD) return { level: "warning", score: phishingProb, modelVersion: MODEL_ID };
-    return { level: "safe", score: phishingProb, modelVersion: MODEL_ID };
-  }
-
-  // This is the PHISHING score directly
-  if (score >= PHISHING_DANGER_THRESHOLD) return { level: "danger", score, modelVersion: MODEL_ID };
-  if (score >= PHISHING_WARNING_THRESHOLD) return { level: "warning", score, modelVersion: MODEL_ID };
-  return { level: "safe", score, modelVersion: MODEL_ID };
-}
-
-async function initModel(): Promise<void> {
-  if (modelState === "ready" || modelState === "loading") return;
-  modelState = "loading";
-
+async function safeStorageGet<T = Record<string, unknown>>(keys: string[]): Promise<T> {
+  const area = storageLocal();
+  if (!area) return {} as T;
   try {
-    // Configure WASM backend
-    env.allowLocalModels = true;
-    env.useBrowserCache = true;
-    // @ts-expect-error — type definitions lag behind the actual API
-    env.backends.onnx.wasm.numThreads = 1;
-
-    try {
-      const wasmBase = chrome.runtime.getURL("assets/");
-      // @ts-expect-error
-      env.backends.onnx.wasm.locator = (file: string) => `${wasmBase}${file}`;
-    } catch {}
-
-    classifier = await pipeline("text-classification", MODEL_ID, {
-      device: "wasm",
-      dtype: "fp32",
-    }) as TextClassificationPipeline;
-
-    modelState = "ready";
-    console.info("[AI Hygiene Offscreen] Model ready:", MODEL_ID);
-
-    // Drain pending requests
-    const pending = [...pendingRequests];
-    pendingRequests = [];
-    for (const resolve of pending) resolve(safeResult());
-  } catch (err) {
-    console.error("[AI Hygiene Offscreen] Model init failed:", err);
-    modelState = "failed";
-    // Drain pending with safe result
-    const pending = [...pendingRequests];
-    pendingRequests = [];
-    for (const resolve of pending) resolve(safeResult());
+    return await area.get(keys) as T;
+  } catch {
+    return {} as T;
   }
+}
+
+async function safeStorageSet(payload: Record<string, unknown>): Promise<void> {
+  const area = storageLocal();
+  if (!area) return;
+  try {
+    await area.set(payload);
+  } catch {}
+}
+
+function setModelState(key: ModelKey, state: ModelState, progress = 0, error?: string): void {
+  statusMap = { ...statusMap, [key]: { key, state, progress, error, readyAt: state === "ready" ? Date.now() : statusMap[key].readyAt } };
+  safeStorageSet({ [MODEL_STATUS_STORAGE_KEY]: statusMap });
+  chrome.runtime.sendMessage({ type: "modelStatusUpdate", statusMap }).catch(() => {});
+}
+
+function normalizeModelError(key: ModelKey, err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const msg = raw.toLowerCase();
+  if (msg.includes("failed to fetch")) {
+    return `${MODELS[key].nickname}: network/CSP fetch failed. Reload extension and retry model download. Details: ${raw}`;
+  }
+  if (msg.includes("no available backend found") || msg.includes("wasm")) {
+    return `${MODELS[key].nickname}: wasm backend init failed. Verify extension was reloaded after build and ORT assets are present. Details: ${raw}`;
+  }
+  if (msg.includes("unsupported model type")) {
+    return `${MODELS[key].nickname}: unsupported model architecture for transformers.js runtime. Details: ${raw}`;
+  }
+  return `${MODELS[key].nickname}: ${raw}`;
+}
+
+function makeProgressCallback(key: ModelKey): ProgressCallback {
+  return (progressEvent) => {
+    if (progressEvent.status !== "progress" || typeof progressEvent.progress !== "number") return;
+    const pct = Math.max(0, Math.min(100, Math.round(progressEvent.progress)));
+    statusMap = { ...statusMap, [key]: { ...statusMap[key], state: "downloading", progress: pct } };
+    chrome.runtime.sendMessage({ type: "modelProgress", key, progress: pct }).catch(() => {});
+  };
+}
+
+function configureEnv(): void {
+  env.allowLocalModels = false;
+  env.allowRemoteModels = true;
+  env.useBrowserCache = true;
+  try {
+    // @ts-expect-error runtime option
+    env.backends.onnx.wasm.numThreads = 1;
+    // @ts-expect-error runtime option
+    env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL("assets/");
+    // @ts-expect-error runtime option
+    env.backends.onnx.wasm.proxy = false;
+  } catch {}
+}
+
+async function loadModel(key: ModelKey): Promise<void> {
+  if (statusMap[key].state === "ready" || statusMap[key].state === "downloading") return;
+  setModelState(key, "downloading", 1);
+  try {
+    const modelLoadPromise = (async () => {
+      if (key === "URL_PHISHING") {
+        urlClassifier = await pipeline("text-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TextClassificationPipeline;
+      } else if (key === "BERT_PHISHING") {
+        contentClassifier = await pipeline("text-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TextClassificationPipeline;
+      } else if (key === "PII_DETECTION") {
+        piiClassifier = await pipeline("token-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TokenClassificationPipeline;
+      }
+    })();
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`Timed out after ${Math.round(MODEL_LOAD_TIMEOUT_MS / 1000)}s while downloading/loading model`)),
+        MODEL_LOAD_TIMEOUT_MS
+      );
+    });
+    await Promise.race([modelLoadPromise, timeoutPromise]);
+    setModelState(key, "ready", 100);
+  } catch (err) {
+    const msg = normalizeModelError(key, err);
+    setModelState(key, "failed", 0, msg);
+  }
+}
+
+async function runDownloadSequence(force = false): Promise<void> {
+  if (downloadSequenceRunning) return;
+  downloadSequenceRunning = true;
+  configureEnv();
+  try {
+    if (force) {
+      urlClassifier = null;
+      contentClassifier = null;
+      piiClassifier = null;
+      for (const key of Object.keys(statusMap) as ModelKey[]) {
+        setModelState(key, "idle", 0);
+      }
+    }
+    const keys = (Object.keys(MODELS) as ModelKey[]).sort((a, b) => MODELS[a].priority - MODELS[b].priority);
+    for (const key of keys) {
+      if (!force && statusMap[key].state === "ready") continue;
+      await loadModel(key);
+    }
+  } finally {
+    downloadSequenceRunning = false;
+    await emitPromptIfNeeded();
+  }
+}
+
+async function emitPromptIfNeeded(): Promise<void> {
+  try {
+    const dismissed = await safeStorageGet<Record<string, boolean>>([DOWNLOAD_PROMPT_KEY]);
+    if (dismissed[DOWNLOAD_PROMPT_KEY]) return;
+    const states = Object.values(statusMap).map((s) => s.state);
+    const needsPrompt = states.some((s) => s === "idle" || s === "failed");
+    if (needsPrompt) {
+      chrome.runtime.sendMessage({ type: "modelDownloadRequired", statusMap }).catch(() => {});
+    }
+  } catch {}
+}
+
+function socialContextScore(url: string, text: string): { score: number; signals: string[] } {
+  const lowerUrl = url.toLowerCase();
+  const lowerText = text.toLowerCase();
+  const signals: string[] = [];
+  let score = 0;
+
+  if (/\b(paypa1|amaz0n|micr0soft|g00gle)\b/.test(lowerUrl)) { score += 0.34; signals.push("typosquatting"); }
+  if (/\.(tk|ml|xyz|top|gq)\b/.test(lowerUrl)) { score += 0.23; signals.push("suspicious_tld"); }
+  if (/http:\/\//.test(lowerUrl)) { score += 0.12; signals.push("http_protocol"); }
+  if (/@/.test(lowerUrl)) { score += 0.18; signals.push("url_with_at_symbol"); }
+  if (/(verify|urgent|suspend|confirm|reset password)/.test(lowerText)) { score += 0.22; signals.push("urgency_language"); }
+  if (/(gift|free money|crypto payout|bank alert)/.test(lowerText)) { score += 0.18; signals.push("social_scam_phrase"); }
+
+  return { score: Math.min(1, score), signals };
+}
+
+function inferLevel(score: number): RiskLevel {
+  if (score >= DANGER_THRESHOLD) return "danger";
+  if (score >= WARNING_THRESHOLD) return "warning";
+  return "safe";
 }
 
 async function classifyUrl(url: string): Promise<MLResult> {
-  if (modelState === "failed") return safeResult();
-
-  if (modelState !== "ready" || !classifier) {
-    if (modelState === "idle") {
-      // Kick off loading
-      initModel().catch(() => {});
-    }
-    // Queue this request until model is ready
-    return new Promise<MLResult>((resolve) => {
-      pendingRequests.push(resolve);
-    });
+  const social = socialContextScore(url, "");
+  if (!urlClassifier || statusMap.URL_PHISHING.state !== "ready") {
+    return { level: inferLevel(social.score), score: social.score, modelVersion: "heuristic_social_fallback" };
   }
-
   try {
-    // Request scores for ALL labels (top_k: null returns all classes)
-    const results = await classifier(url, { top_k: null }) as Array<{ label: string; score: number }>;
-    if (!results || results.length === 0) return safeResult();
-
-    // Find the phishing class entry if present
-    const phishingEntry = results.find(r => {
-      const lc = r.label.toLowerCase();
-      return lc.includes("phishing") || lc.includes("label_1") || lc.includes("bad");
-    });
-
-    if (phishingEntry) {
-      // Use the phishing class probability directly
-      return scoreToLevel(phishingEntry.label, phishingEntry.score);
-    }
-
-    // Fallback: use top result
-    return scoreToLevel(results[0].label, results[0].score);
-  } catch (err) {
-    console.error("[AI Hygiene Offscreen] Inference error:", err);
-    return safeResult();
+    const outputs = await urlClassifier(url, { top_k: null }) as Array<{ label: string; score: number }>;
+    const top = outputs?.[0];
+    const modelRisk = top ? (top.label.toLowerCase().includes("negative") ? top.score : 1 - top.score) : 0;
+    const fused = Math.max(social.score, modelRisk * 0.55);
+    return { level: inferLevel(fused), score: fused, modelVersion: MODELS.URL_PHISHING.id };
+  } catch {
+    return { level: inferLevel(social.score), score: social.score, modelVersion: "heuristic_social_fallback" };
   }
 }
 
-// ---------------------------------------------------------------------------
-// Message handler
-// ---------------------------------------------------------------------------
+async function classifyContent(url: string, text: string): Promise<MLResult> {
+  const social = socialContextScore(url, text);
+  if (!contentClassifier || statusMap.BERT_PHISHING.state !== "ready") {
+    return { level: inferLevel(social.score), score: social.score, modelVersion: "heuristic_social_fallback" };
+  }
+  try {
+    const outputs = await contentClassifier(text.slice(0, 1200), { top_k: null }) as Array<{ label: string; score: number }>;
+    const top = outputs?.[0];
+    const modelRisk = top ? (top.label.toLowerCase().includes("negative") ? top.score : 1 - top.score) : 0;
+    const fused = Math.max(social.score, modelRisk * 0.5);
+    return { level: inferLevel(fused), score: fused, modelVersion: MODELS.BERT_PHISHING.id };
+  } catch {
+    return { level: inferLevel(social.score), score: social.score, modelVersion: "heuristic_social_fallback" };
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === "ping") {
-    sendResponse({ type: "pong" });
+  if (message.type === "downloadModels" || message.type === "offscreen.downloadModels") {
+    runDownloadSequence(true).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
   }
 
-  if (message.type === "initML") {
-    initModel()
-      .then(() => sendResponse({ ok: true, model: MODEL_ID }))
-      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+  if (message.type === "getModelStatus" || message.type === "offscreen.getModelStatus") {
+    sendResponse({ statusMap });
     return true;
   }
 
-  if (message.type === "analyzeUrl") {
+  if (message.type === "dismissModelPrompt" || message.type === "offscreen.dismissModelPrompt") {
+    safeStorageSet({ [DOWNLOAD_PROMPT_KEY]: true }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (message.type === "analyzeUrl" || message.type === "scanUrl") {
     const { url } = message as { url: string };
-    if (!url) { sendResponse(safeResult()); return true; }
-    classifyUrl(url)
-      .then((result) => sendResponse(result))
-      .catch(() => sendResponse(safeResult()));
+    classifyUrl(url ?? "").then((result) => sendResponse(result)).catch(() => sendResponse({ level: "safe", score: 0, modelVersion: "fallback" }));
+    return true;
+  }
+
+  if (message.type === "analyzeContent" || message.type === "scanContent") {
+    const { url, text } = message as { url: string; text: string };
+    Promise.all([classifyUrl(url ?? ""), classifyContent(url ?? "", text ?? "")]).then(([urlRes, contentRes]) => {
+      const combined = Math.max(urlRes.score, contentRes.score);
+      sendResponse({
+        level: inferLevel(combined),
+        score: combined,
+        urlScore: urlRes.score,
+        contentScore: contentRes.score,
+        modelVersion: `${urlRes.modelVersion} | ${contentRes.modelVersion}`,
+      });
+    }).catch(() => sendResponse({ level: "safe", score: 0, modelVersion: "fallback" }));
+    return true;
+  }
+
+  if (message.type === "scanPii") {
+    const { text } = message as { text: string };
+    if (!piiClassifier || statusMap.PII_DETECTION.state !== "ready") {
+      sendResponse({ hasPii: false, entities: [], confidence: 0 });
+      return true;
+    }
+    piiClassifier(text?.slice(0, 600) ?? "")
+      .then((results) => {
+        const flagged = (results ?? []).filter((r: { label: string; score: number }) => r.label !== "O" && r.score > 0.8);
+        sendResponse({
+          hasPii: flagged.length > 0,
+          entities: [...new Set(flagged.map((r: { label: string }) => r.label.replace(/^[BI]-/, "")))],
+          confidence: flagged.length ? flagged.reduce((s: number, r: { score: number }) => s + r.score, 0) / flagged.length : 0,
+        });
+      })
+      .catch(() => sendResponse({ hasPii: false, entities: [], confidence: 0 }));
     return true;
   }
 
   return false;
 });
 
-// Auto-start model loading when offscreen document is created
-initModel().catch(() => {});
+(async () => {
+  try {
+    const stored = await safeStorageGet<Record<string, ModelStatusMap>>([MODEL_STATUS_STORAGE_KEY]);
+    if (stored[MODEL_STATUS_STORAGE_KEY]) {
+      const saved = stored[MODEL_STATUS_STORAGE_KEY] as ModelStatusMap;
+      statusMap = Object.fromEntries((Object.keys(saved) as ModelKey[]).map((key) => [
+        key,
+        { ...saved[key], state: saved[key].state === "downloading" ? "idle" : saved[key].state, progress: saved[key].state === "downloading" ? 0 : saved[key].progress },
+      ])) as ModelStatusMap;
+    }
+  } catch {}
+  chrome.runtime.sendMessage({ type: "modelStatusUpdate", statusMap }).catch(() => {});
+  runDownloadSequence(false).catch(() => {});
+})();
