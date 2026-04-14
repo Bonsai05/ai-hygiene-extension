@@ -2,7 +2,7 @@
 
 # 🛡️ AI Hygiene Companion
 
-**A production-grade Chrome Extension for real-time, on-device protection against phishing, trackers, and social engineering — powered by a Dual-Layer AI pipeline and a gamified "Safe-to-Earn" reward system.**
+**A Chrome Extension for real-time, on-device protection against phishing, trackers, and social engineering — powered by offscreen local models and a gamified "Safe-to-Earn" reward system.**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/your-org/ai-hygiene-extension/ci.yml?style=flat-square)](https://github.com/your-org/ai-hygiene-extension/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -19,7 +19,7 @@
 
 ## Overview
 
-Traditional browser security tools rely on static blocklists and cloud-based heuristics — both of which lag behind the rapid mutation rate of modern phishing campaigns and trackers. The **AI Hygiene Companion** runs entirely on-device, combining a lightweight ONNX inference engine with an optional AMD NPU-accelerated heavyweight model to deliver real-time, privacy-preserving threat detection with zero external telemetry.
+Traditional browser security tools rely on static blocklists and cloud-based heuristics — both of which lag behind the rapid mutation rate of modern phishing campaigns and trackers. The **AI Hygiene Companion** runs entirely on-device using offscreen local models + heuristic fusion to deliver real-time, privacy-preserving threat detection with zero external telemetry.
 
 ---
 
@@ -29,8 +29,9 @@ Traditional browser security tools rely on static blocklists and cloud-based heu
 |---|---|
 | **Real-Time URL Analysis** | Detects phishing URLs using a locally executing ONNX model before the page fully renders |
 | **DOM Content Scanning** | Content scripts continuously analyse page text for credential-harvesting language, fake urgency, and dark patterns |
-| **Dual-Layer AI Pipeline** | Lightweight built-in WASM models for instant classification; opt-in heavyweight LLMs (Llama 3.2, DeepSeek R1) for deep de-obfuscation via a local NPU daemon |
+| **Standalone AI Pipeline** | Offscreen Transformers.js models auto-download and run locally; no backend required for runtime detection |
 | **Shadow DOM Warning Banners** | Threat alerts are injected inside a ShadowRoot, making them tamper-proof even on malicious pages |
+| **Scanner Page** | Dedicated Scanner page in popup with AMD NPU-style simulation UI, staged pipeline logs, and fused-risk verdict preview |
 | **Safe-to-Earn Gamification** | Earn XP and badges for safe behaviour; receive penalties for bypassing threat warnings — all enforced via a mutex-locked state engine |
 | **Per-URL XP Awarding** | Every unique page navigation awards +5 XP — scrolling YouTube Shorts awards XP for each new video |
 | **Privacy First** | All inference runs locally. No browsing data, URLs, or page content is ever sent to an external server |
@@ -40,7 +41,7 @@ Traditional browser security tools rely on static blocklists and cloud-based heu
 
 ## 🏗 Architecture
 
-The extension is built around a **split-compute pipeline** that resolves the tension between real-time performance and deep analytical capability.
+The extension is built around a **standalone offscreen pipeline** optimized for MV3 constraints and predictable local inference.
 
 ```
  ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -57,34 +58,20 @@ The extension is built around a **split-compute pipeline** that resolves the ten
  │                                    │   ONNX WebGPU/WASM     │               │
  │                                    └───────────────────────┘               │
  └─────────────────────────────────────────────────────────────────────────────┘
-                                               │ optional localhost call
-                                               ▼
-                                  ┌─────────────────────────┐
-                                  │  Local NPU Daemon        │
-                                  │  (Lemonade / GAIA /      │
-                                  │   LM Studio)             │
-                                  │  Llama 3.2 · DeepSeek R1 │
-                                  │  AMD Ryzen™ AI NPU       │
-                                  └─────────────────────────┘
 ```
 
-### Layer 1 — Lightweight Built-In Engine *(Zero Configuration)*
+### Layer 1 — Lightweight Built-In Engine *(Default)*
 
 Runs entirely inside the browser via the [Offscreen Document API](https://developer.chrome.com/docs/extensions/reference/offscreen/), which provides access to WebAssembly and WebGPU without violating MV3 restrictions.
 
-- **Model:** `pirocheto/phishing-url-detection` — a fast, ONNX-quantised model for lexical URL classification
+- **Models:** DistilBERT-based text classifiers + BERT NER for PII scanning (all local)
 - **Execution:** WebGPU (primary) → WASM SIMD (fallback)
 - **Latency:** Sub-100ms URL classification before the page finishes loading
 - **Privacy:** Model weights are fetched from HuggingFace and cached locally in IndexedDB. Zero data leaves the device at inference time.
 
-### Layer 2 — Heavyweight NPU Engine *(Opt-In)*
+### Layer 2 — Scanner Simulation *(UI/Debug)*
 
-For advanced tasks — de-obfuscating malicious JavaScript payloads, analysing multi-stage redirect chains, or generating plain-language threat explanations — the extension routes requests to a locally running LLM endpoint.
-
-- **Supported Runtimes:** [AMD GAIA](https://github.com/amd/gaia), [Lemonade Server](https://www.amd.com/en/developer/resources/technical-articles/2025/ryzen-ai-radeon-llms-with-lemonade.html), or any OpenAI-compatible local API
-- **Models:** `Llama 3.2 (1B/3B)`, `DeepSeek-R1 Distill`, `Qwen 2.5 Coder`
-- **Hardware:** AMD Ryzen™ AI NPU via the XDNA architecture and Vitis AI Execution Provider
-- **Communication:** Strictly bound to `localhost` — the extension never calls external LLM APIs
+The popup includes a dedicated Scanner page that visualizes an AMD NPU-style staged scan pipeline (URL parse → social scan → infer → fuse). It is currently simulation-driven for UX and debugging consistency.
 
 For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
@@ -112,7 +99,6 @@ For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 - **Node.js** ≥ 18.0.0 and **npm** ≥ 9
 - A Chromium-based browser (Chrome 116+)
-- *(Optional)* A local LLM daemon for NPU acceleration
 
 ### Clone & Build
 
@@ -136,8 +122,7 @@ The compiled extension is placed in the `dist/` directory.
 2. Enable **Developer mode** (toggle in the top-right corner)
 3. Click **Load unpacked**
 4. Select the `dist/` folder from this repository
-5. Run `api/setup.bat` once to register the Native Messaging host and backend dependencies
-6. Reload the extension
+5. Reload the extension after each new build
 
 ### Standalone Model Behavior (Current)
 
@@ -146,6 +131,7 @@ The compiled extension is placed in the `dist/` directory.
 - Popup and Settings show live model states (`idle`, `downloading`, `ready`, `failed`) with progress.
 - If models are missing/failed, popup shows a download prompt and Settings provides retry.
 - Risk popups are gated by high-confidence fused scoring to reduce false positives.
+- If model runtime init fails, popup/settings surface explicit diagnostic errors.
 
 ### Development Mode (Hot Reload)
 
@@ -209,9 +195,10 @@ For the full badge catalogue and level titles see **[GAMIFICATION.md](GAMIFICATI
 
 Click the **⚙ gear icon** in the dashboard to access Settings:
 
-- **Backend Models (Always Active)** — live status of lightweight backend models loaded at startup
-- **Deep AI Analysis (Heavy Model)** — optional heavy model download and activation
-- **Backend Connection** — localhost URL and backend mode control
+- **Standalone Models** — live model state (`idle/downloading/ready/failed`) and progress
+- **Download / Retry Models** — manual trigger for model download/recovery
+- **Scan Behavior** — on-device AI scan toggle
+- **Notifications** — XP/badge/level/danger alert controls
 
 ---
 
@@ -238,7 +225,8 @@ ai-hygiene-extension/
 │   │   ├── components/          # Reusable UI components (XPBar, BadgeGrid, etc.)
 │   │   ├── pages/
 │   │   │   ├── Onboarding.tsx   # First-run onboarding flow
-│   │   │   └── Settings.tsx     # Extension settings panel
+│   │   │   ├── Settings.tsx     # Extension settings panel
+│   │   │   └── ScannerPage.tsx  # Dedicated scanner simulation page
 │   │   └── Popup.tsx            # Root popup component
 │   ├── background.ts            # MV3 Service Worker — message router and state orchestrator
 │   ├── content-script.ts        # Page-injected DOM scanner
@@ -280,10 +268,10 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full terms.
 
 ## 🙏 Credits
 
-- [**pirocheto**](https://huggingface.co/pirocheto) — for the `phishing-url-detection` ONNX model
-- [**ONNX Community**](https://huggingface.co/onnx-community) — for maintaining quantised, browser-ready model distributions
+- [**Xenova**](https://huggingface.co/Xenova) — for browser-compatible Transformer model distributions
+- [**ONNX Runtime Web**](https://onnxruntime.ai/docs/get-started/with-javascript/web.html) — for local WASM execution in extension contexts
 - [**Hugging Face**](https://huggingface.co/) — for Transformers.js, which makes in-browser ML inference possible
-- [**AMD**](https://www.amd.com/en/developer/resources/ryzen-ai-software.html) — for the Ryzen™ AI / XDNA NPU architecture and the GAIA open-source framework
+- [**AMD**](https://www.amd.com/en/developer/resources/ryzen-ai-software.html) — for the Ryzen™ AI / XDNA references used in scanner simulation and UX direction
 - The academic research documented in [`AI Hygiene Companion Chrome Extension.md`](AI%20Hygiene%20Companion%20Chrome%20Extension.md) that informed the dual-model threat detection strategy
 
 ---
