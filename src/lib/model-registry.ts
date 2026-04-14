@@ -17,11 +17,11 @@ export const MODELS = {
   },
   /** Layer 1B: Content phishing signal */
   BERT_PHISHING: {
-    id: "Xenova/twitter-roberta-base-sentiment-latest",
+    id: "Xenova/distilbert-base-uncased-finetuned-sst-2-english",
     nickname: "BERT Phishing (DOM)",
-    description: "Content sentiment/risk signal blended with phishing heuristics.",
-    size: "~124 MB",
-    dtype: "q8" as const,
+    description: "Text risk signal blended with phishing heuristics.",
+    size: "~67 MB",
+    dtype: "fp32" as const,
     priority: 2,
   },
   /** Layer 1C: PII token detector */
@@ -30,7 +30,7 @@ export const MODELS = {
     nickname: "PII Shield",
     description: "Detects personally identifiable information typed into form fields on risky pages.",
     size: "~108 MB",
-    dtype: "q8" as const,
+    dtype: "fp32" as const,
     priority: 3,
   },
 } as const;

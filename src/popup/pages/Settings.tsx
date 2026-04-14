@@ -29,6 +29,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   });
 
   const [modelStatus, setModelStatus] = useState<ModelStatusMap>(defaultModelStatusMap());
+  const [modelStatusError, setModelStatusError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -46,6 +47,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     try {
       const res = await chrome.runtime.sendMessage({ type: "getModelStatus" });
       if (res?.statusMap) setModelStatus(res.statusMap as ModelStatusMap);
+      setModelStatusError(typeof res?.error === "string" ? res.error : null);
     } catch {}
   };
 
@@ -84,13 +86,20 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
   async function handleDownloadModels() {
     setDownloading(true);
+    setModelStatusError(null);
     try {
       const res = await chrome.runtime.sendMessage({ type: "downloadModels" });
       if (!res?.ok) {
+        if (typeof res?.error === "string") {
+          setModelStatusError(res.error);
+        } else {
+          setModelStatusError("Model download request failed.");
+        }
         setDownloading(false);
       }
       setTimeout(loadModelStatus, 1000);
     } catch {
+      setModelStatusError("Failed to send model download request.");
       setDownloading(false);
     }
   }
@@ -116,6 +125,11 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
           <p className="text-xs text-muted-foreground">
             Models download automatically on extension load. Retry download if any model is failed/idle.
           </p>
+          {modelStatusError && (
+            <div className="text-[10px] border border-red-500 bg-red-50 text-red-700 p-2">
+              {modelStatusError}
+            </div>
+          )}
           <div className="space-y-2">
             {(Object.keys(MODELS) as ModelKey[]).map((key) => {
               const s = modelStatus[key];

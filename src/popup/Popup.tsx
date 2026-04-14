@@ -144,6 +144,10 @@ export default function Popup() {
   const downloading = modelStates.some((s) => s === "downloading");
   const failed = modelStates.some((s) => s === "failed");
   const idle = modelStates.some((s) => s === "idle");
+  const firstFailedError =
+    modelStatusMap
+      ? Object.values(modelStatusMap).find((m) => m.state === "failed")?.error ?? null
+      : null;
 
   return (
     <div className="w-[380px] h-[600px] bg-background border-4 border-border relative overflow-hidden flex flex-col font-mono text-foreground font-medium">
@@ -201,6 +205,13 @@ export default function Popup() {
                 Later
               </button>
             </div>
+          </div>
+        )}
+        {firstFailedError && (
+          <div className="border-2 border-red-500 bg-red-50 p-3 text-xs space-y-1">
+            <p className="font-bold text-red-800">Model download error</p>
+            <p className="text-red-700 break-words">{firstFailedError}</p>
+            <p className="text-red-700">Open Settings and click `Download / Retry Models` after reload.</p>
           </div>
         )}
         <RiskStatus />

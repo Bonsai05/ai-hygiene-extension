@@ -191,6 +191,11 @@ function broadcast(msg: Record<string, unknown>): void {
   chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
+function isFromOffscreen(sender?: chrome.runtime.MessageSender): boolean {
+  const url = sender?.url ?? "";
+  return url.includes("offscreen.html");
+}
+
 async function notifyXpChange(stats: UserStats, xpDelta: number, reason: string): Promise<void> {
   const progress = xpInLevel(stats.xp);
   broadcast({
@@ -807,7 +812,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
         // Fallback: read from storage
         const stored = await chrome.storage.local.get([MODEL_STATUS_STORAGE_KEY]);
         const statusMap: ModelStatusMap = stored[MODEL_STATUS_STORAGE_KEY] ?? defaultModelStatusMap();
-        sendResponse({ statusMap });
+        sendResponse({ statusMap, error: "Offscreen runtime unavailable. Reload extension popup and retry." });
       });
     return true;
   }
@@ -833,18 +838,24 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
   // (Offscreen sends this; background relays to popup since offscreen can't
   //  directly reach popup UI windows.)
   if (message.type === "modelProgress") {
-    broadcast(message);
+    if (isFromOffscreen(sender)) {
+      broadcast(message);
+    }
     return false; // no async response needed
   }
 
   // ── Relay modelStatusUpdate from offscreen → popup ────────────────────────
   if (message.type === "modelStatusUpdate") {
-    broadcast(message);
+    if (isFromOffscreen(sender)) {
+      broadcast(message);
+    }
     return false;
   }
 
   if (message.type === "modelDownloadRequired") {
-    broadcast(message);
+    if (isFromOffscreen(sender)) {
+      broadcast(message);
+    }
     return false;
   }
 

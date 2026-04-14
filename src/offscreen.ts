@@ -7,6 +7,7 @@ interface MLResult { level: RiskLevel; score: number; modelVersion: string; cont
 const DANGER_THRESHOLD = 0.86;
 const WARNING_THRESHOLD = 0.68;
 const DOWNLOAD_PROMPT_KEY = "modelDownloadPromptDismissed";
+const MODEL_LOAD_TIMEOUT_MS = 120000;
 
 let urlClassifier: TextClassificationPipeline | null = null;
 let contentClassifier: TextClassificationPipeline | null = null;
@@ -14,9 +15,31 @@ let piiClassifier: TokenClassificationPipeline | null = null;
 let statusMap: ModelStatusMap = defaultModelStatusMap();
 let downloadSequenceRunning = false;
 
+function storageLocal(): chrome.storage.StorageArea | null {
+  return globalThis.chrome?.storage?.local ?? null;
+}
+
+async function safeStorageGet<T = Record<string, unknown>>(keys: string[]): Promise<T> {
+  const area = storageLocal();
+  if (!area) return {} as T;
+  try {
+    return await area.get(keys) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+async function safeStorageSet(payload: Record<string, unknown>): Promise<void> {
+  const area = storageLocal();
+  if (!area) return;
+  try {
+    await area.set(payload);
+  } catch {}
+}
+
 function setModelState(key: ModelKey, state: ModelState, progress = 0, error?: string): void {
   statusMap = { ...statusMap, [key]: { key, state, progress, error, readyAt: state === "ready" ? Date.now() : statusMap[key].readyAt } };
-  chrome.storage.local.set({ [MODEL_STATUS_STORAGE_KEY]: statusMap }).catch(() => {});
+  safeStorageSet({ [MODEL_STATUS_STORAGE_KEY]: statusMap });
   chrome.runtime.sendMessage({ type: "modelStatusUpdate", statusMap }).catch(() => {});
 }
 
@@ -60,27 +83,36 @@ function configureEnv(): void {
 
 async function loadModel(key: ModelKey): Promise<void> {
   if (statusMap[key].state === "ready" || statusMap[key].state === "downloading") return;
-  setModelState(key, "downloading", 0);
+  setModelState(key, "downloading", 1);
   try {
-    if (key === "URL_PHISHING") {
-      urlClassifier = await pipeline("text-classification", MODELS[key].id, {
-        device: "wasm",
-        dtype: MODELS[key].dtype,
-        progress_callback: makeProgressCallback(key),
-      }) as TextClassificationPipeline;
-    } else if (key === "BERT_PHISHING") {
-      contentClassifier = await pipeline("text-classification", MODELS[key].id, {
-        device: "wasm",
-        dtype: MODELS[key].dtype,
-        progress_callback: makeProgressCallback(key),
-      }) as TextClassificationPipeline;
-    } else if (key === "PII_DETECTION") {
-      piiClassifier = await pipeline("token-classification", MODELS[key].id, {
-        device: "wasm",
-        dtype: MODELS[key].dtype,
-        progress_callback: makeProgressCallback(key),
-      }) as TokenClassificationPipeline;
-    }
+    const modelLoadPromise = (async () => {
+      if (key === "URL_PHISHING") {
+        urlClassifier = await pipeline("text-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TextClassificationPipeline;
+      } else if (key === "BERT_PHISHING") {
+        contentClassifier = await pipeline("text-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TextClassificationPipeline;
+      } else if (key === "PII_DETECTION") {
+        piiClassifier = await pipeline("token-classification", MODELS[key].id, {
+          device: "wasm",
+          dtype: MODELS[key].dtype,
+          progress_callback: makeProgressCallback(key),
+        }) as TokenClassificationPipeline;
+      }
+    })();
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`Timed out after ${Math.round(MODEL_LOAD_TIMEOUT_MS / 1000)}s while downloading/loading model`)),
+        MODEL_LOAD_TIMEOUT_MS
+      );
+    });
+    await Promise.race([modelLoadPromise, timeoutPromise]);
     setModelState(key, "ready", 100);
   } catch (err) {
     const msg = normalizeModelError(key, err);
@@ -93,6 +125,14 @@ async function runDownloadSequence(force = false): Promise<void> {
   downloadSequenceRunning = true;
   configureEnv();
   try {
+    if (force) {
+      urlClassifier = null;
+      contentClassifier = null;
+      piiClassifier = null;
+      for (const key of Object.keys(statusMap) as ModelKey[]) {
+        setModelState(key, "idle", 0);
+      }
+    }
     const keys = (Object.keys(MODELS) as ModelKey[]).sort((a, b) => MODELS[a].priority - MODELS[b].priority);
     for (const key of keys) {
       if (!force && statusMap[key].state === "ready") continue;
@@ -106,7 +146,7 @@ async function runDownloadSequence(force = false): Promise<void> {
 
 async function emitPromptIfNeeded(): Promise<void> {
   try {
-    const dismissed = await chrome.storage.local.get([DOWNLOAD_PROMPT_KEY]);
+    const dismissed = await safeStorageGet<Record<string, boolean>>([DOWNLOAD_PROMPT_KEY]);
     if (dismissed[DOWNLOAD_PROMPT_KEY]) return;
     const states = Object.values(statusMap).map((s) => s.state);
     const needsPrompt = states.some((s) => s === "idle" || s === "failed");
@@ -182,7 +222,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "dismissModelPrompt" || message.type === "offscreen.dismissModelPrompt") {
-    chrome.storage.local.set({ [DOWNLOAD_PROMPT_KEY]: true }).then(() => sendResponse({ ok: true }));
+    safeStorageSet({ [DOWNLOAD_PROMPT_KEY]: true }).then(() => sendResponse({ ok: true }));
     return true;
   }
 
@@ -231,7 +271,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 (async () => {
   try {
-    const stored = await chrome.storage.local.get([MODEL_STATUS_STORAGE_KEY]);
+    const stored = await safeStorageGet<Record<string, ModelStatusMap>>([MODEL_STATUS_STORAGE_KEY]);
     if (stored[MODEL_STATUS_STORAGE_KEY]) {
       const saved = stored[MODEL_STATUS_STORAGE_KEY] as ModelStatusMap;
       statusMap = Object.fromEntries((Object.keys(saved) as ModelKey[]).map((key) => [
