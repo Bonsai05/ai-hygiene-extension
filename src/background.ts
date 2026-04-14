@@ -1,25 +1,19 @@
 // src/background.ts
 // Service worker — core orchestration.
 //
-// Architecture (v2):
-//   PRIMARY:  FastAPI backend (http://127.0.0.1:8000) — 7 lightweight models, always-on.
-//             Started automatically via Chrome Native Messaging (host.py) on extension load.
-//   FALLBACK: Heuristic-only analysis when backend is offline.
-//   OFFSCREEN: Retained as dead fallback (Transformers.js), not used as primary path.
-//
 // XP award rules:
 //   • Every unique URL visit on a safe/warning page → +5 or +10 XP
 //   • Landing on a danger page → -15 XP + streak reset (deduped per URL)
 //   • Risky action (download / ext link) on risky page → -15 XP
+//   • "Unique URL" is tracked in chrome.storage.session so it survives
+//     across SW restarts but resets on browser restart.
 //
-// ML pipeline (backend, 7 models):
-//   1A. ealvaradob/phishing-url-detection      — URL lexical analysis (ONNX)
-//   1B. phishbot/ScamLLM                       — Social engineering / scam content
-//   1C. onnx-community/bert-finetuned-phishing — Credential harvesting DOM text
-//   1D. gravitee-io/bert-small-pii-detection   — PII leakage in form fields
-//   1E. ealvaradob/bert-base-uncased-ft-phishing-urls — URL redundancy model
-//   1F. cybersectony/phishing-email-detection-distilbert — Email phishing content
-//   1G. mrm8488/bert-tiny-finetuned-sms-spam-detection  — Spam/smishing signal
+// ML pipeline (3 models, no TinyBERT):
+//   Layer 1A: pirocheto/phishing-url-detection      — URL lexical analysis
+//   Layer 1B: phishbot/ScamLLM                      — social engineering content
+//   Layer 1C: onnx-community/bert-finetuned-phishing — DOM text / credential harvesting
+//   Layer 1D: gravitee-io/bert-small-pii-detection  — PII leakage in form fields
+//   Models are downloaded sequentially by the offscreen doc on first run.
 
 import {
   loadStats,
@@ -38,6 +32,7 @@ import {
   applyRecoveryCompleted,
   getLevelTitle,
   levelFromXp,
+  xpInLevel,
   xpProgressInLevel,
   type UserStats,
   type RiskLevel,
@@ -121,8 +116,7 @@ function setBadge(tabId: number, level: RiskLevel): void {
 
 // ---------------------------------------------------------------------------
 // Warning banner (Shadow DOM, tamper-proof)
-// Only injected when we have HIGH CONFIDENCE (ML confirms OR heuristic is "danger")
-// FIXED: Never inject banners on heuristic "warning" alone without ML confirmation.
+// Richer version: shows risk score + threat list
 // ---------------------------------------------------------------------------
 function injectBanner(
   tabId: number,
@@ -134,6 +128,7 @@ function injectBanner(
     target: { tabId },
     func: (riskLevel: string, riskScore: number, threatList: string[]) => {
       const BANNER_ID = "ai-hygiene-banner-host";
+      // Remove existing banner before re-injecting (score/threats may have changed)
       document.getElementById(BANNER_ID)?.remove();
 
       const host = document.createElement("div");
@@ -151,7 +146,7 @@ function injectBanner(
 
       const isDanger = riskLevel === "danger";
       const bg = isDanger ? "#dc2626" : "#d97706";
-      const pct = riskScore > 0 ? ` (${Math.round(riskScore)}% confidence)` : "";
+      const pct = riskScore > 0 ? ` (${Math.round(riskScore * 100)}% confidence)` : "";
       const headline = isDanger
         ? `🚨 Dangerous site detected${pct} — close this tab immediately.`
         : `⚠️ Suspicious site detected${pct} — don't enter personal information.`;
@@ -197,8 +192,7 @@ function broadcast(msg: Record<string, unknown>): void {
 }
 
 async function notifyXpChange(stats: UserStats, xpDelta: number, reason: string): Promise<void> {
-  // FIXED: use xpProgressInLevel instead of xpInLevel to avoid boundary issues
-  const progress = xpProgressInLevel(stats.xp, stats.level);
+  const progress = xpInLevel(stats.xp);
   broadcast({
     type: xpDelta >= 0 ? "xpGain" : "xpLoss",
     xpAmount: Math.abs(xpDelta),
@@ -206,14 +200,14 @@ async function notifyXpChange(stats: UserStats, xpDelta: number, reason: string)
     totalXp: stats.xp,
     level: stats.level,
     levelTitle: getLevelTitle(stats.level),
-    xpProgress: progress,
+    xpProgress: { current: progress, max: XP_PER_LEVEL },
   });
 
   if (await canShowToast()) {
     const sign = xpDelta >= 0 ? "+" : "-";
     await showBrowserNotification(
       `${sign}${Math.abs(xpDelta)} XP — ${reason}`,
-      `Level ${stats.level} ${getLevelTitle(stats.level)} | ${progress.current}/${XP_PER_LEVEL} XP`
+      `Level ${stats.level} ${getLevelTitle(stats.level)} | ${progress}/${XP_PER_LEVEL} XP`
     ).catch(() => {});
   }
 }
@@ -233,137 +227,13 @@ async function notifyNewBadges(badgeIds: string[], stats: UserStats): Promise<vo
 }
 
 // ---------------------------------------------------------------------------
-// Native Messaging — manages host.py lifecycle
+// ML: Backend FastAPI / Ollama (optional)
 // ---------------------------------------------------------------------------
-let nativePort: chrome.runtime.Port | null = null;
-let backendStatus: "setup_required" | "starting" | "ready" | "offline" = "starting";
-let _backendHealthy = false;
-let _backendProvider = "CPU";
-let _backendModels: Record<string, string> = {};
-let _heavyModelStatus: { loaded: boolean; model_id: string | null; status: string } = {
-  loaded: false, model_id: null, status: "unloaded"
-};
+interface MLResult { level: RiskLevel; score: number; provider: string }
 
-function connectNativeHost(): void {
+async function queryBackend(url: string, backendUrl: string): Promise<MLResult | null> {
   try {
-    nativePort = chrome.runtime.connectNative("com.ai_hygiene");
-    nativePort.onMessage.addListener((msg: Record<string, unknown>) => {
-      console.info("[AI Hygiene] Native host:", msg);
-      if (msg.status === "started" || msg.server_running) {
-        // Server process started — start polling health
-        pollBackendHealth();
-      }
-    });
-    nativePort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError?.message ?? "unknown";
-      nativePort = null;
-      if (err.includes("Native host has exited") || err.includes("not found")) {
-        // Host binary not registered — setup not done yet
-        backendStatus = "setup_required";
-        broadcast({ type: "backendStatus", status: "setup_required" });
-      } else {
-        backendStatus = "offline";
-        broadcast({ type: "backendStatus", status: "offline" });
-        // Retry in 10s
-        setTimeout(ensureBackend, 10_000);
-      }
-    });
-    // Send START action
-    nativePort.postMessage({ action: "START" });
-  } catch (e) {
-    backendStatus = "setup_required";
-    broadcast({ type: "backendStatus", status: "setup_required" });
-  }
-}
-
-let _pollInterval: ReturnType<typeof setInterval> | null = null;
-
-function pollBackendHealth(): void {
-  if (_pollInterval) return; // already polling
-  _pollInterval = setInterval(async () => {
-    try {
-      const res = await fetch(`${DEFAULT_BACKEND_URL}/health`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        _backendHealthy = true;
-        _backendProvider = data.provider ?? "CPU";
-        _backendModels = data.models ?? {};
-        _heavyModelStatus = data.heavy_model ?? { loaded: false, model_id: null, status: "unloaded" };
-        const readyCount = Object.values(_backendModels).filter(s => s === "ready").length;
-        backendStatus = "ready";
-        broadcast({
-          type: "backendStatus",
-          status: "ready",
-          provider: _backendProvider,
-          modelsReady: readyCount,
-          modelsTotal: Object.keys(_backendModels).length,
-          models: _backendModels,
-          heavyModel: _heavyModelStatus,
-        });
-      } else {
-        _backendHealthy = false;
-        backendStatus = "offline";
-        broadcast({ type: "backendStatus", status: "offline" });
-      }
-    } catch {
-      _backendHealthy = false;
-      if (backendStatus !== "starting") {
-        backendStatus = "offline";
-        broadcast({ type: "backendStatus", status: "offline" });
-      }
-    }
-  }, 3000);
-}
-
-async function ensureBackend(): Promise<void> {
-  backendStatus = "starting";
-  broadcast({ type: "backendStatus", status: "starting" });
-  connectNativeHost();
-}
-
-// ---------------------------------------------------------------------------
-// ML: Backend FastAPI — primary inference path
-// ---------------------------------------------------------------------------
-interface MLResult { level: RiskLevel; score: number; provider: string; signals?: string[] }
-interface EnsembleResult extends MLResult {
-  individual?: Record<string, number>;
-  pii?: { has_pii: boolean; pii_types: string[] } | null;
-  modelsReady?: number;
-  modelsTotal?: number;
-  heavyModelActive?: boolean;
-}
-
-async function queryBackendEnsemble(url: string, text = ""): Promise<EnsembleResult | null> {
-  try {
-    const res = await fetch(`${DEFAULT_BACKEND_URL}/analyze/ensemble`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, text }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return {
-      level: (data.level as RiskLevel) ?? "safe",
-      score: typeof data.score === "number" ? data.score : 0,
-      provider: data.provider ?? "Backend",
-      signals: data.models_used ?? [],
-      individual: data.individual,
-      pii: data.pii,
-      modelsReady: data.models_ready,
-      modelsTotal: data.models_total,
-      heavyModelActive: data.heavy_model_active,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function queryBackendUrl(url: string): Promise<MLResult | null> {
-  try {
-    const res = await fetch(`${DEFAULT_BACKEND_URL}/analyze/url`, {
+    const res = await fetch(`${backendUrl}/analyze/url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
@@ -371,18 +241,18 @@ async function queryBackendUrl(url: string): Promise<MLResult | null> {
     });
     if (!res.ok) return null;
     const data = await res.json();
-    return {
-      level: (data.level as RiskLevel) ?? "safe",
-      score: typeof data.score === "number" ? data.score : 0,
-      provider: data.provider ?? "Backend",
-    };
+    // Backend returns score as integer 0-100. data.phishing_score is a dead field — removed.
+    const rawScore = typeof data.score === "number" ? data.score : 0;
+    const score: number = rawScore / 100;
+    const level: RiskLevel = score >= 0.7 ? "danger" : score >= 0.3 ? "warning" : "safe";
+    return { level, score, provider: data.provider ?? "Local FastAPI" };
   } catch {
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// ML: Offscreen Transformers.js (fallback only — not primary path)
+// ML: Offscreen Transformers.js (optional)
 // ---------------------------------------------------------------------------
 let creatingOffscreen: Promise<void> | null = null;
 
@@ -391,8 +261,8 @@ async function ensureOffscreen(): Promise<void> {
   if (creatingOffscreen) { await creatingOffscreen; return; }
   creatingOffscreen = chrome.offscreen.createDocument({
     url: "offscreen.html",
-    reasons: ["BLOBS"],  // FIXED: was "WORKERS" — incorrect for WASM blob URLs
-    justification: "Fallback ML inference with Transformers.js",
+    reasons: ["BLOBS"],
+    justification: "ML inference with Transformers.js",
   }).then(() => {
     creatingOffscreen = null;
   }).catch((err) => {
@@ -402,19 +272,62 @@ async function ensureOffscreen(): Promise<void> {
   await creatingOffscreen;
 }
 
+// URL-only quick scan (Layer 1A)
+async function queryOffscreenML(url: string): Promise<MLResult | null> {
+  try {
+    await ensureOffscreen();
+    const result = await chrome.runtime.sendMessage({ type: "analyzeUrl", url });
+    if (!result) return null;
+    return { level: result.level, score: result.score, provider: result.modelVersion ?? "Transformers.js" };
+  } catch {
+    return null;
+  }
+}
+
+// Combined content scan (Layers 1A + 1B + 1C) with 5s timeout
+async function queryOffscreenContent(
+  url: string,
+  text: string
+): Promise<{ level: RiskLevel; score: number; urlScore: number; contentScore: number; provider: string } | null> {
+  try {
+    await ensureOffscreen();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const result = await Promise.race([
+      chrome.runtime.sendMessage({ type: "analyzeContent", url, text }),
+      new Promise<null>((_res, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+    ]) as {
+      level: RiskLevel; score: number; urlScore?: number; contentScore?: number; modelVersion?: string
+    } | null;
+    clearTimeout(timeout);
+    if (!result) return null;
+    return {
+      level: result.level,
+      score: result.score,
+      urlScore: result.urlScore ?? result.score,
+      contentScore: result.contentScore ?? result.score,
+      provider: result.modelVersion ?? "Transformers.js (combined)",
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Inference Queue — per-tab, max 1 in-flight, 500ms debounce
+// Prevents WASM OOM from concurrent inference calls.
 // ---------------------------------------------------------------------------
 class InferenceQueue {
   private inFlight = new Set<number>();
   private timers = new Map<number, ReturnType<typeof setTimeout>>();
 
+  /** Schedule an inference for tabId with debounce. */
   schedule(tabId: number, fn: () => Promise<void>, debounceMs = 500): void {
     const existing = this.timers.get(tabId);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(() => {
       this.timers.delete(tabId);
-      if (this.inFlight.has(tabId)) return;
+      if (this.inFlight.has(tabId)) return; // skip if already running for this tab
       this.inFlight.add(tabId);
       fn().catch(() => {}).finally(() => this.inFlight.delete(tabId));
     }, debounceMs);
@@ -438,7 +351,57 @@ interface BackendSettings {
 }
 
 function defaultBackendSettings(): BackendSettings {
-  return { enabled: true, useLocalBackend: true, backendUrl: DEFAULT_BACKEND_URL };
+  return { enabled: true, useLocalBackend: false, backendUrl: DEFAULT_BACKEND_URL };
+}
+
+let nativePort: chrome.runtime.Port | null = null;
+let backendBroadcastTimer: ReturnType<typeof setInterval> | null = null;
+
+function connectNativeHost(): void {
+  if (nativePort) return;
+  try {
+    nativePort = chrome.runtime.connectNative("com.ai_hygiene");
+    nativePort.postMessage({ action: "START" });
+    nativePort.onMessage.addListener((msg) => {
+      if (msg?.status === "started" || msg?.status === "already_running") {
+        broadcast({ type: "backendStatus", status: "starting" });
+      } else if (msg?.status === "error") {
+        broadcast({ type: "backendStatus", status: "offline", error: msg?.message ?? "native_host_error" });
+      }
+    });
+    nativePort.onDisconnect.addListener(() => {
+      nativePort = null;
+      broadcast({ type: "backendStatus", status: "setup_required" });
+    });
+  } catch {
+    nativePort = null;
+    broadcast({ type: "backendStatus", status: "setup_required" });
+  }
+}
+
+async function getBackendHealthSnapshot(): Promise<Record<string, unknown>> {
+  try {
+    const settings = await getBackendSettings();
+    const res = await fetch(`${settings.backendUrl}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return { status: "offline" };
+    const data = await res.json();
+    return { status: "ready", data };
+  } catch {
+    return { status: nativePort ? "starting" : "setup_required" };
+  }
+}
+
+function startBackendStatusBroadcast(): void {
+  if (backendBroadcastTimer) return;
+  backendBroadcastTimer = setInterval(async () => {
+    const snapshot = await getBackendHealthSnapshot();
+    broadcast({ type: "backendStatus", ...snapshot });
+  }, 3000);
+}
+
+async function initializeRuntime(): Promise<void> {
+  // Standalone mode: offscreen-only model runtime.
+  ensureOffscreenAndDownload();
 }
 
 async function getBackendSettings(): Promise<BackendSettings> {
@@ -448,12 +411,12 @@ async function getBackendSettings(): Promise<BackendSettings> {
 
 // ---------------------------------------------------------------------------
 // Core analysis + XP award
-// FIXED: Banner only injected with ML confirmation OR hard heuristic danger signal
-// FIXED: http_protocol alone never triggers a banner (handled in risk-detection.ts)
+// FIX: XP is awarded AFTER analysis completes, not before.
+// FIX: Danger pages are now deduped the same way as safe pages.
 // ---------------------------------------------------------------------------
 
 // In-memory domain cache (service worker lifetime)
-const domainCache = new Map<string, { level: RiskLevel; patterns: string[]; score: number; time: number }>();
+const domainCache = new Map<string, { level: RiskLevel; patterns: string[]; time: number }>();
 const CACHE_TTL_MS = 30_000; // 30s per domain
 
 async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
@@ -462,94 +425,94 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
   let hostname = "";
   try { hostname = new URL(url).hostname; } catch { return; }
 
-  // ── 1. Heuristic analysis (always, very fast) ──────────────────────────────
+  // ── 1. Heuristic analysis (always, very fast) ────────────────────────────
   const heuristic = analyzeUrl(url);
 
-  // ── 2. Check domain cache ──────────────────────────────────────────────────
+  // ── 2. Check domain cache ────────────────────────────────────────────────
   const cached = domainCache.get(hostname);
   const useCached = cached && (Date.now() - cached.time) < CACHE_TTL_MS;
 
   let finalLevel: RiskLevel = heuristic.level;
   let patterns: string[] = heuristic.patterns;
-  let mlScore = 0;
 
   if (!useCached) {
-    // ── 3. Query backend ensemble (primary ML path) ──────────────────────────
-    let mlResult: EnsembleResult | null = null;
+    // ── 3. ML analysis (optional) ──────────────────────────────────────────
+    const settings = await getBackendSettings();
+    let mlResult: MLResult | null = null;
 
-    if (_backendHealthy) {
-      mlResult = await queryBackendEnsemble(url, "").catch(() => null);
+    if (settings.useLocalBackend) {
+      mlResult = await queryBackend(url, settings.backendUrl).catch(() => null);
     }
-
-    if (mlResult && !mlResult.individual?.url_phishing) {
-      // If ensemble didn't include URL model, also run URL-specific check
-      const urlCheck = await queryBackendUrl(url).catch(() => null);
-      if (urlCheck && urlCheck.level === "danger") {
-        mlResult = { ...mlResult, level: "danger", score: Math.max(mlResult.score, urlCheck.score) };
-      }
+    if (!mlResult && settings.enabled) {
+      mlResult = await queryOffscreenML(url).catch(() => null);
     }
 
     if (mlResult) {
-      // ML can only escalate risk, never downgrade a heuristic "danger"
-      if (mlResult.level === "danger") finalLevel = "danger";
-      else if (mlResult.level === "warning" && finalLevel === "safe") finalLevel = "warning";
-      mlScore = mlResult.score;
-      console.info(`[AI Hygiene] Ensemble:${mlResult.level}(${mlResult.score}) Heuristic:${heuristic.level} | ${mlResult.provider} | Models: ${mlResult.modelsReady}/${mlResult.modelsTotal}`);
-    } else {
-      console.info(`[AI Hygiene] Backend offline — heuristic only: ${heuristic.level}`);
+      // ML can only escalate risk, never downgrade heuristic danger
+      if (mlResult.level === "danger" && mlResult.score >= 0.86) finalLevel = "danger";
+      else if (mlResult.level === "warning" && finalLevel === "safe" && mlResult.score >= 0.68) finalLevel = "warning";
+      console.info(`[AI Hygiene] ML:${mlResult.level}(${mlResult.score?.toFixed(2)}) Heuristic:${heuristic.level} | ${mlResult.provider}`);
     }
 
-    domainCache.set(hostname, { level: finalLevel, patterns, score: mlScore, time: Date.now() });
+    domainCache.set(hostname, { level: finalLevel, patterns, time: Date.now() });
   } else {
     finalLevel = cached.level;
     patterns = cached.patterns;
-    mlScore = cached.score;
   }
 
-  // ── 4. Update badge (always) ───────────────────────────────────────────────
+  // ── 4. Update passive indicators immediately (heuristic result) ──────────
+  const heuristicThreats = patterns.map(p => p.replace(/_/g, " "));
   saveRiskLevel(finalLevel);
-  if (tabId !== undefined) setBadge(tabId, finalLevel);
+  if (tabId !== undefined) {
+    setBadge(tabId, finalLevel);
+    if (finalLevel !== "safe") injectBanner(tabId, finalLevel, 0, heuristicThreats);
+  }
+  broadcast({ type: "riskUpdate", level: finalLevel });
+  broadcast({ type: "mlRiskResult", level: finalLevel, mlScore: null, modelVersion: "Heuristic+URL", threats: heuristicThreats });
+  broadcast({ type: "threatUpdate", threats: heuristicThreats, level: finalLevel });
 
-  // ── 5. Build threat display strings ───────────────────────────────────────
-  const threatStrings = patterns.map(p => p.replace(/_/g, " "));
+  // ── 5. Schedule Layers 1B+1C combined content scan (queued, non-blocking) ─
+  if (tabId !== undefined) {
+    getBackendSettings().then(settings => {
+      if (!settings.enabled) return;
+      inferenceQueue.schedule(tabId!, async () => {
+        broadcast({ type: "mlScanStart", tabId });
+        const contentResult = await queryOffscreenContent(url, "").catch(() => null);
+        broadcast({ type: "mlScanDone", tabId });
+        if (!contentResult) return;
 
-  // ── 6. Inject banner — ONLY with sufficient evidence ──────────────────────
-  // FIXED: No banner for heuristic "warning" alone (avoids false positives on HTTP sites)
-  // Banner fires when:
-  //   a) ML ensemble confirms danger (score >= 70) OR
-  //   b) Heuristic hard-signals danger (IP, typosquat, data URI) — no ML needed
-  //   c) ML ensemble confirms warning (score >= 35) AND heuristic also warns
-  const bannerConfirmedByMl = _backendHealthy && (
-    (mlScore >= 70 && finalLevel === "danger") ||
-    (mlScore >= 35 && finalLevel === "warning" && heuristic.level === "warning")
-  );
-  const bannerConfirmedByHeuristic = finalLevel === "danger" && (
-    patterns.includes("typosquatting") ||
-    patterns.includes("ip_address_hostname") ||
-    patterns.includes("data_uri") ||
-    patterns.includes("url_with_at_symbol")
-  );
+        const combinedLevel: RiskLevel =
+          (contentResult.level === "danger" && contentResult.score >= 0.86) || finalLevel === "danger"
+            ? "danger"
+            : (contentResult.level === "warning" && contentResult.score >= 0.68) || finalLevel === "warning"
+              ? "warning"
+              : "safe";
 
-  if (tabId !== undefined && finalLevel !== "safe") {
-    if (bannerConfirmedByMl || bannerConfirmedByHeuristic) {
-      injectBanner(tabId, finalLevel, mlScore, threatStrings);
-    }
+        const mlThreats: string[] = [...heuristicThreats];
+        if (contentResult.urlScore >= 0.55) mlThreats.push(`Phishing URL (${Math.round(contentResult.urlScore * 100)}%)`);
+        if (contentResult.contentScore >= 0.55) mlThreats.push(`Deceptive Content (${Math.round(contentResult.contentScore * 100)}%)`);
+
+        saveRiskLevel(combinedLevel);
+        setBadge(tabId!, combinedLevel);
+        if (combinedLevel !== "safe") injectBanner(tabId!, combinedLevel, contentResult.score, mlThreats);
+        broadcast({ type: "riskUpdate", level: combinedLevel });
+        broadcast({
+          type: "mlRiskResult",
+          level: combinedLevel,
+          mlScore: contentResult.score,
+          mlScorePct: Math.round(contentResult.score * 100),
+          urlScore: contentResult.urlScore,
+          contentScore: contentResult.contentScore,
+          modelVersion: contentResult.provider,
+          threats: mlThreats,
+        });
+        broadcast({ type: "threatUpdate", threats: mlThreats, level: combinedLevel });
+        console.info(`[AI Hygiene] Combined: ${combinedLevel} (${Math.round(contentResult.score * 100)}%) | ${contentResult.provider}`);
+      });
+    });
   }
 
-  // ── 7. Broadcast to popup ─────────────────────────────────────────────────
-  broadcast({ type: "riskUpdate", level: finalLevel });
-  broadcast({
-    type: "mlRiskResult",
-    level: finalLevel,
-    mlScore,
-    mlScorePct: mlScore,
-    modelVersion: _backendHealthy ? `Backend (${_backendProvider})` : "Heuristic",
-    threats: threatStrings,
-    backendHealthy: _backendHealthy,
-  });
-  broadcast({ type: "threatUpdate", threats: threatStrings, level: finalLevel });
-
-  // ── 8. XP awards / penalties — deduped per URL ────────────────────────────
+  // ── 6. XP awards / penalties — deduped per URL ───────────────────────────
   try {
     const alreadyAwarded = await hasAwardedXpForUrl(url);
     if (alreadyAwarded) return;
@@ -586,8 +549,10 @@ async function analyzeAndAward(url: string, tabId?: number): Promise<void> {
 let lastUrl = "";
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Fire on URL change in active tab
   if (changeInfo.url && tab?.active) {
     lastUrl = changeInfo.url;
+    // If navigating away from a danger tab, award danger-avoided XP
     isTabDanger(tabId).then(wasDanger => {
       if (wasDanger) {
         unmarkTabDanger(tabId);
@@ -621,100 +586,37 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Notification settings default
-// ---------------------------------------------------------------------------
-interface NotificationSettings {
-  xpGainEnabled: boolean;
-  badgeEarnedEnabled: boolean;
-  levelUpEnabled: boolean;
-  dangerAlertEnabled: boolean;
-}
-
-function defaultNotificationSettings(): NotificationSettings {
-  return { xpGainEnabled: true, badgeEarnedEnabled: true, levelUpEnabled: true, dangerAlertEnabled: true };
-}
-
-// ---------------------------------------------------------------------------
 // Message handlers
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, sendResponse) => {
   if (typeof message.type !== "string") return false;
 
-  // ── getRiskLevel ───────────────────────────────────────────────────────────
+  // ── getRiskLevel ──────────────────────────────────────────────────────────
   if (message.type === "getRiskLevel") {
     loadRiskLevel().then(level => sendResponse({ level }));
     return true;
   }
 
-  // ── getStats ───────────────────────────────────────────────────────────────
+  // ── getStats ──────────────────────────────────────────────────────────────
   if (message.type === "getStats") {
     loadStats().then(stats => sendResponse({ stats }));
     return true;
   }
 
-  // ── getDashboardData ───────────────────────────────────────────────────────
+  // ── getDashboardData ──────────────────────────────────────────────────────
   if (message.type === "getDashboardData") {
     Promise.all([loadStats(), loadRiskLevel()]).then(([stats, riskLevel]) => {
-      const progress = xpProgressInLevel(stats.xp, stats.level);
-      const modelsReady = Object.values(_backendModels).filter(s => s === "ready").length;
-      const modelsTotal = Object.keys(_backendModels).length || 7; // default 7 known models
       sendResponse({
         stats,
         riskLevel,
         levelTitle: getLevelTitle(stats.level),
-        xpProgress: progress,
-        backendStatus,
-        backendProvider: _backendProvider,
-        backendModels: _backendModels,
-        modelsReady,
-        modelsTotal,
-        heavyModel: _heavyModelStatus,
+        xpProgress: xpProgressInLevel(stats.xp, stats.level),
       });
     });
     return true;
   }
 
-  // ── getBackendStatus ───────────────────────────────────────────────────────
-  if (message.type === "getBackendStatus") {
-    sendResponse({
-      status: backendStatus,
-      provider: _backendProvider,
-      models: _backendModels,
-      heavyModel: _heavyModelStatus,
-    });
-    return true;
-  }
-
-  // ── loadHeavyModel ─────────────────────────────────────────────────────────
-  if (message.type === "loadHeavyModel") {
-    const modelId = (message.modelId as string) ?? "Qwen/Qwen2.5-1.5B-Instruct";
-    fetch(`${DEFAULT_BACKEND_URL}/heavy/load`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: modelId }),
-      signal: AbortSignal.timeout(10000),
-    }).then(r => r.json()).then(data => {
-      sendResponse({ ok: true, ...data });
-      // Start polling heavy model status
-      _pollHeavyModelStatus();
-    }).catch(err => sendResponse({ ok: false, error: String(err) }));
-    return true;
-  }
-
-  // ── unloadHeavyModel ───────────────────────────────────────────────────────
-  if (message.type === "unloadHeavyModel") {
-    fetch(`${DEFAULT_BACKEND_URL}/heavy/unload`, {
-      method: "POST",
-      signal: AbortSignal.timeout(10000),
-    }).then(r => r.json()).then(data => {
-      _heavyModelStatus = { loaded: false, model_id: null, status: "unloaded" };
-      broadcast({ type: "heavyModelStatus", loaded: false, status: "unloaded" });
-      sendResponse({ ok: true, ...data });
-    }).catch(err => sendResponse({ ok: false, error: String(err) }));
-    return true;
-  }
-
-  // ── pageScanResult (from content script) ──────────────────────────────────
+  // ── pageScanResult (from content script) ─────────────────────────────────
   if (message.type === "pageScanResult") {
     const { url, signals, trackers, pageText } = message as {
       url: string;
@@ -727,6 +629,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     const urlAnalysis = analyzeUrl(url);
     const contentAnalysis = contentRiskFromSignals(signals, urlAnalysis);
 
+    // Broadcast tracker information to popup
     if (trackers && trackers.length > 0) {
       broadcast({ type: "trackersDetected", count: trackers.length, trackers });
     }
@@ -736,10 +639,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       broadcast({ type: "riskUpdate", level: contentAnalysis.level });
       if (tabId !== undefined) {
         setBadge(tabId, contentAnalysis.level);
-        // Content scan confirms danger — inject banner
-        if (contentAnalysis.level === "danger") {
-          injectBanner(tabId, contentAnalysis.level, 90, contentAnalysis.patterns.map(p => p.replace(/_/g, " ")));
-        }
+        injectBanner(tabId, contentAnalysis.level);
       }
 
       if (contentAnalysis.level === "danger" && tabId !== undefined) {
@@ -751,6 +651,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       }
     }
 
+    // Habit signals
     const isPasswordOnHttp = signals.passwordOnHttp || signals.missingSecurityIndicators;
     if (isPasswordOnHttp) {
       updateStats(s => applyPasswordOnHttp(s)).then(({ stats, newBadges }) => {
@@ -762,27 +663,26 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
       });
     }
 
-    // Route PII scan to backend if available, fallback to offscreen
+    // PII scan — if a password/email field is detected on a non-safe page, run PII detection
+    // This is fire-and-forget (non-blocking for the response)
     if (signals.hasPasswordField && pageText && contentAnalysis.level !== "safe") {
-      if (_backendHealthy) {
-        fetch(`${DEFAULT_BACKEND_URL}/analyze/pii`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: pageText }),
-          signal: AbortSignal.timeout(5000),
-        }).then(r => r.json()).then(piiData => {
-          if (piiData.has_pii) {
-            broadcast({ type: "piiDetected", entities: piiData.pii_types, confidence: piiData.confidence });
-          }
-        }).catch(() => {});
-      }
+      queryOffscreenForPii(pageText).then((piiResult) => {
+        if (piiResult?.hasPii) {
+          broadcast({
+            type: "piiDetected",
+            entities: piiResult.entities,
+            confidence: piiResult.confidence,
+          });
+          console.warn("[AI Hygiene] PII detected in form field context:", piiResult.entities);
+        }
+      }).catch(() => {});
     }
 
     sendResponse({ ok: true });
     return true;
   }
 
-  // ── riskyActionDetected ────────────────────────────────────────────────────
+  // ── riskyActionDetected ───────────────────────────────────────────────────
   if (message.type === "riskyActionDetected") {
     const { pageRiskLevel, action } = message as { pageRiskLevel: string; action: string };
     if (pageRiskLevel === "warning" || pageRiskLevel === "danger") {
@@ -794,13 +694,13 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
-  // ── dismissWarning ─────────────────────────────────────────────────────────
+  // ── dismissWarning ────────────────────────────────────────────────────────
   if (message.type === "dismissWarning") {
     sendResponse({ ok: true });
     return true;
   }
 
-  // ── panicInitiated ─────────────────────────────────────────────────────────
+  // ── panicInitiated ────────────────────────────────────────────────────────
   if (message.type === "panicInitiated") {
     updateStats(s => applyPanicInitiated(s)).then(({ stats }) => {
       sendResponse({ stats });
@@ -808,7 +708,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
-  // ── recoveryCompleted ──────────────────────────────────────────────────────
+  // ── recoveryCompleted ─────────────────────────────────────────────────────
   if (message.type === "recoveryCompleted") {
     loadStats().then(prevStats => {
       updateStats(s => applyRecoveryCompleted(s)).then(async ({ stats, newBadges }) => {
@@ -821,7 +721,7 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
-  // ── Settings ───────────────────────────────────────────────────────────────
+  // ── Settings ──────────────────────────────────────────────────────────────
   if (message.type === "getSettings") {
     chrome.storage.local.get(["backendSettings", "notificationSettings"]).then((result) => {
       sendResponse({
@@ -840,69 +740,190 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
     return true;
   }
 
-  // ── Model status (for Settings UI backward compat) ────────────────────────
-  if (message.type === "getModelStatus") {
-    // Return backend model status as ModelStatusMap format
-    const statusMap: ModelStatusMap = defaultModelStatusMap();
-    // Map backend models to the legacy format for Settings UI compatibility
-    sendResponse({ statusMap, backendModels: _backendModels, backendStatus });
+  if (message.type === "startBackend") {
+    try {
+      if (!nativePort) connectNativeHost();
+      nativePort?.postMessage({ action: "START" });
+      sendResponse({ success: true });
+    } catch {
+      sendResponse({ success: false, note: "Native messaging host is not registered. Run api/setup.bat." });
+    }
     return true;
   }
 
-  // ── domMutationScan (from content script MutationObserver) ────────────────
+  if (message.type === "getBackendHealth") {
+    getBackendHealthSnapshot().then((snapshot) => sendResponse(snapshot));
+    return true;
+  }
+
+  if (message.type === "loadHeavyModel") {
+    const { modelId } = message as { modelId: string };
+    getBackendSettings().then(async (settings) => {
+      try {
+        const res = await fetch(`${settings.backendUrl}/heavy/load`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: modelId }),
+        });
+        sendResponse(await res.json());
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error) });
+      }
+    });
+    return true;
+  }
+
+  if (message.type === "unloadHeavyModel") {
+    getBackendSettings().then(async (settings) => {
+      try {
+        const res = await fetch(`${settings.backendUrl}/heavy/unload`, { method: "POST" });
+        sendResponse(await res.json());
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error) });
+      }
+    });
+    return true;
+  }
+
+  if (message.type === "getHeavyStatus") {
+    getBackendSettings().then(async (settings) => {
+      try {
+        const res = await fetch(`${settings.backendUrl}/heavy/status`, { method: "POST" });
+        sendResponse(await res.json());
+      } catch (error) {
+        sendResponse({ loaded: false, status: "offline", error: String(error) });
+      }
+    });
+    return true;
+  }
+
+  // ── Model status (query from Settings UI) ────────────────────────────────
+  if (message.type === "getModelStatus") {
+    // First try to get live status from the offscreen doc
+    ensureOffscreen()
+      .then(() => chrome.runtime.sendMessage({ type: "offscreen.getModelStatus" }))
+      .then((res) => sendResponse(res))
+      .catch(async () => {
+        // Fallback: read from storage
+        const stored = await chrome.storage.local.get([MODEL_STATUS_STORAGE_KEY]);
+        const statusMap: ModelStatusMap = stored[MODEL_STATUS_STORAGE_KEY] ?? defaultModelStatusMap();
+        sendResponse({ statusMap });
+      });
+    return true;
+  }
+
+  // ── Trigger model download sequence ──────────────────────────────────────
+  if (message.type === "downloadModels") {
+    ensureOffscreen()
+      .then(() => chrome.runtime.sendMessage({ type: "offscreen.downloadModels" }))
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  if (message.type === "dismissModelPrompt") {
+    ensureOffscreen()
+      .then(() => chrome.runtime.sendMessage({ type: "offscreen.dismissModelPrompt" }))
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // ── Relay modelProgress from offscreen → popup ────────────────────────────
+  // (Offscreen sends this; background relays to popup since offscreen can't
+  //  directly reach popup UI windows.)
+  if (message.type === "modelProgress") {
+    broadcast(message);
+    return false; // no async response needed
+  }
+
+  // ── Relay modelStatusUpdate from offscreen → popup ────────────────────────
+  if (message.type === "modelStatusUpdate") {
+    broadcast(message);
+    return false;
+  }
+
+  if (message.type === "modelDownloadRequired") {
+    broadcast(message);
+    return false;
+  }
+
+  // ── Daemon manager (heavy model / Ollama) ─────────────────────────────────
+  if (message.type === "detectRuntime") {
+    detectAvailableRuntime().then(runtime => sendResponse(runtime));
+    return true;
+  }
+
+  if (message.type === "installOllama") {
+    chrome.tabs.create({ url: "https://ollama.com/download" });
+    pollForRuntime("ollama", 120_000).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === "pullModel") {
+    const { model } = message as { model: string };
+    pullModelWithProgress(model, (pct) => {
+      broadcast({ type: "modelPullProgress", percent: pct });
+    }).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // ── domMutationScan (from content script MutationObserver) ──────────────
+  // Dynamic text added to the page — queue a lightweight content scan.
   if (message.type === "domMutationScan") {
     const { url, text } = message as { url: string; text: string };
     const tabId = sender.tab?.id;
-    if (tabId !== undefined && url && text && _backendHealthy) {
-      inferenceQueue.schedule(tabId, async () => {
-        const result = await queryBackendEnsemble(url, text).catch(() => null);
-        if (!result || result.level === "safe") return;
-
-        loadRiskLevel().then(currentLevel => {
-          const escalated: RiskLevel =
-            result.level === "danger" || currentLevel === "danger" ? "danger" : "warning";
-          saveRiskLevel(escalated);
-          setBadge(tabId, escalated);
-          const mutThreats = result.score >= 70
-            ? [`ML Threat Detection (${result.score}%)`]
-            : ["Suspicious Dynamic Content"];
-          // Only inject for confirmed threats from ML
-          if (result.score >= 35) injectBanner(tabId, escalated, result.score, mutThreats);
-          broadcast({ type: "riskUpdate", level: escalated });
-          broadcast({ type: "threatUpdate", threats: mutThreats, level: escalated });
-        });
-      }, 1500);
+    if (tabId !== undefined && url && text) {
+      getBackendSettings().then(settings => {
+        if (!settings.enabled) return;
+        inferenceQueue.schedule(tabId, async () => {
+          const result = await queryOffscreenContent(url, text).catch(() => null);
+          if (!result || result.level === "safe") return;
+          // Only escalate — never downgrade an existing warning/danger
+          loadRiskLevel().then(currentLevel => {
+            const escalated: RiskLevel =
+              result.level === "danger" || currentLevel === "danger" ? "danger"
+              : "warning";
+            saveRiskLevel(escalated);
+            setBadge(tabId, escalated);
+            const mutationThreats = result.contentScore >= 0.55
+              ? [`Deceptive Language (${Math.round(result.contentScore * 100)}%)`]
+              : ["Suspicious Dynamic Content"];
+            injectBanner(tabId, escalated, result.score, mutationThreats);
+            broadcast({ type: "riskUpdate", level: escalated });
+            broadcast({ type: "threatUpdate", threats: mutationThreats, level: escalated });
+          });
+        }, 1500); // longer debounce for mutations (less urgent than navigation)
+      });
     }
     return false;
   }
 
-  // ── piiInputScan (from content script field monitor) ──────────────────────
+  // ── piiInputScan (from content script field monitor) ─────────────────────
+  // User typed into a sensitive field — run PII detection.
   if (message.type === "piiInputScan") {
     const { text, fieldId } = message as { text: string; fieldId: string; url: string };
     const tabId = sender.tab?.id;
-    if (tabId !== undefined && text && _backendHealthy) {
-      fetch(`${DEFAULT_BACKEND_URL}/analyze/pii`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-        signal: AbortSignal.timeout(5000),
-      }).then(r => r.json()).then(piiData => {
-        if (!piiData.has_pii) return;
+    if (tabId !== undefined && text) {
+      queryOffscreenForPii(text).then(piiResult => {
+        if (!piiResult?.hasPii) return;
+        // Send piiFieldWarning back to the specific tab's content script
         chrome.tabs.sendMessage(tabId, {
           type: "piiFieldWarning",
           fieldId,
-          entities: piiData.pii_types,
-          confidence: piiData.confidence,
+          entities: piiResult.entities,
+          confidence: piiResult.confidence,
         }).catch(() => {});
-        broadcast({ type: "piiDetected", fieldId, entities: piiData.pii_types, confidence: piiData.confidence });
+        // Also broadcast to popup for the threat list
+        broadcast({
+          type: "piiDetected",
+          fieldId,
+          entities: piiResult.entities,
+          confidence: piiResult.confidence,
+        });
+        console.warn("[AI Hygiene] PII in form input:", piiResult.entities, "field:", fieldId);
       }).catch(() => {});
     }
-    return false;
-  }
-
-  // ── Relay modelProgress / modelStatusUpdate (for offscreen fallback) ───────
-  if (message.type === "modelProgress" || message.type === "modelStatusUpdate") {
-    broadcast(message);
     return false;
   }
 
@@ -910,41 +931,116 @@ chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, 
 });
 
 // ---------------------------------------------------------------------------
-// Heavy model status polling (started when heavy model begins loading)
+// Notification settings default
 // ---------------------------------------------------------------------------
-let _heavyPollInterval: ReturnType<typeof setInterval> | null = null;
+interface NotificationSettings {
+  xpGainEnabled: boolean;
+  badgeEarnedEnabled: boolean;
+  levelUpEnabled: boolean;
+  dangerAlertEnabled: boolean;
+}
 
-function _pollHeavyModelStatus(): void {
-  if (_heavyPollInterval) clearInterval(_heavyPollInterval);
-  _heavyPollInterval = setInterval(async () => {
-    try {
-      const res = await fetch(`${DEFAULT_BACKEND_URL}/heavy/status`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      _heavyModelStatus = {
-        loaded: data.loaded,
-        model_id: data.model_id,
-        status: data.status,
-      };
-      broadcast({
-        type: "heavyModelStatus",
-        loaded: data.loaded,
-        model_id: data.model_id,
-        status: data.status,
-        progress: data.progress,
-      });
-      if (data.status === "ready" || data.status === "failed") {
-        clearInterval(_heavyPollInterval!);
-        _heavyPollInterval = null;
-      }
-    } catch {}
-  }, 2000);
+function defaultNotificationSettings(): NotificationSettings {
+  return { xpGainEnabled: true, badgeEarnedEnabled: true, levelUpEnabled: true, dangerAlertEnabled: true };
 }
 
 // ---------------------------------------------------------------------------
-// Install + Startup
+// Daemon manager helpers (Ollama / LM Studio / Lemonade detection)
+// ---------------------------------------------------------------------------
+type DaemonRuntime = "ollama" | "lemonade" | "lmstudio" | "none";
+
+async function detectAvailableRuntime(): Promise<DaemonRuntime> {
+  const endpoints = [
+    { url: "http://localhost:11434/api/tags", runtime: "ollama" as const },
+    { url: "http://localhost:8000/health", runtime: "lemonade" as const },
+    { url: "http://localhost:1234/v1/models", runtime: "lmstudio" as const },
+  ];
+
+  for (const { url, runtime } of endpoints) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) return runtime;
+    } catch {}
+  }
+  return "none";
+}
+
+async function pollForRuntime(runtime: DaemonRuntime, timeoutMs: number): Promise<void> {
+  const startTime = Date.now();
+  const urlMap: Record<string, string> = {
+    ollama: "http://localhost:11434/api/tags",
+    lemonade: "http://localhost:8000/health",
+    lmstudio: "http://localhost:1234/v1/models",
+  };
+  const checkUrl = urlMap[runtime];
+  if (!checkUrl) throw new Error("Unknown runtime");
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const res = await fetch(checkUrl, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) return;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  throw new Error(`Runtime ${runtime} not available after ${timeoutMs}ms`);
+}
+
+async function pullModelWithProgress(model: string, onProgress: (pct: number) => void): Promise<void> {
+  const res = await fetch("http://localhost:11434/api/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: model, stream: true }),
+  });
+
+  if (!res.ok) throw new Error(`Pull failed: ${res.status}`);
+  if (!res.body) throw new Error("No response body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const lines = decoder.decode(value).split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const data = JSON.parse(line);
+        if (data.total && data.completed) {
+          onProgress(Math.round((data.completed / data.total) * 100));
+        }
+        if (data.status === "success") onProgress(100);
+      } catch {}
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PII query helper (offscreen)
+// ---------------------------------------------------------------------------
+async function queryOffscreenForPii(text: string): Promise<{ hasPii: boolean; entities: string[]; confidence: number } | null> {
+  try {
+    await ensureOffscreen();
+    const result = await chrome.runtime.sendMessage({ type: "scanPii", text });
+    return result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ensure offscreen + trigger model downloads
+// ---------------------------------------------------------------------------
+async function ensureOffscreenAndDownload(): Promise<void> {
+  try {
+    await ensureOffscreen();
+    // Fire-and-forget — we don't need to await completion
+    chrome.runtime.sendMessage({ type: "downloadModels" }).catch(() => {});
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Install
 // ---------------------------------------------------------------------------
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await loadStats();
@@ -955,14 +1051,18 @@ chrome.runtime.onInstalled.addListener(async () => {
   saveRiskLevel("safe");
   await showBrowserNotification(
     "AI Hygiene Companion Activated 🛡️",
-    "Starting local ML backend — 7 models loading in background…"
+    "Ready to help you browse safely and earn XP!"
   ).catch(() => {});
 
-  // Auto-start backend via Native Messaging
-  ensureBackend();
+  await initializeRuntime();
 });
 
+// ---------------------------------------------------------------------------
+// Startup (subsequent browser starts)
+// ---------------------------------------------------------------------------
 chrome.runtime.onStartup.addListener(() => {
-  // Re-connect and re-start backend on browser restart
-  ensureBackend();
+  initializeRuntime();
 });
+
+// Also run when the service worker wakes outside install/startup events.
+initializeRuntime();

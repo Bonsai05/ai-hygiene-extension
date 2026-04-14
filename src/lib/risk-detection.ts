@@ -218,14 +218,14 @@ export function contentRiskFromSignals(
     return { level: "safe", score: urlAnalysis.score, patterns, reason: urlAnalysis.reason };
   }
 
-  // 3+ suspicious phrases on an unknown site → escalate
-  if (signals.suspiciousPhrases.length >= 3) {
+  // 5+ suspicious phrases on an unknown site → escalate
+  if (signals.suspiciousPhrases.length >= 5) {
     patterns.push("urgency_language_detected");
     if (level === "safe") level = "warning";
   }
 
-  // Login form (with actual password field) + 2+ urgency phrases → escalate
-  if (signals.hasLoginForm && signals.suspiciousPhrases.length >= 2) {
+  // Login form (with actual password field) + 3+ urgency phrases → escalate
+  if (signals.hasLoginForm && signals.suspiciousPhrases.length >= 3) {
     patterns.push("phishing_characteristics");
     if (level === "safe") level = "warning";
   }

@@ -1,47 +1,37 @@
 // src/lib/model-registry.ts
-// Single source of truth for model status types and storage key.
-// Used by background.ts (model status tracking) and Settings UI.
-// NOTE: v2 backend-first — offscreen Transformers.js is a dead fallback only.
+// Single source of truth for all local ONNX model identifiers, metadata,
+// and status types. Imported by offscreen.ts, background.ts, and Settings UI.
 
 // ---------------------------------------------------------------------------
-// Model definitions (3 models; no TinyBERT per spec)
+// Model definitions for standalone offscreen inference.
 // ---------------------------------------------------------------------------
 export const MODELS = {
-  /** Layer 1A: Lexical URL phishing detection — smallest, loads first */
+  /** Layer 1A: URL classifier (lightweight) */
   URL_PHISHING: {
-    id: "pirocheto/phishing-url-detection",
+    id: "Xenova/distilbert-base-uncased-finetuned-sst-2-english",
     nickname: "URL Phishing Detector",
-    description: "Lexical analysis of URLs to detect phishing domains. Runs on every page visit.",
-    size: "~12 MB",
+    description: "Fast local classifier used as one signal in URL risk scoring.",
+    size: "~67 MB",
     dtype: "fp32" as const,
     priority: 1,
   },
-  /** Layer 1B: RoBERTa-based social engineering / scam content detection */
-  CONTENT_SCAM: {
-    id: "phishbot/ScamLLM",
-    nickname: "ScamLLM",
-    description: "Identifies deceptive social engineering and AI-generated phishing in page text.",
-    size: "~125 MB",
+  /** Layer 1B: Content phishing signal */
+  BERT_PHISHING: {
+    id: "Xenova/twitter-roberta-base-sentiment-latest",
+    nickname: "BERT Phishing (DOM)",
+    description: "Content sentiment/risk signal blended with phishing heuristics.",
+    size: "~124 MB",
     dtype: "q8" as const,
     priority: 2,
   },
-  /** Layer 1C: DistilBERT fine-tuned for phishing DOM text & credential harvesting */
-  BERT_PHISHING: {
-    id: "onnx-community/bert-finetuned-phishing-ONNX",
-    nickname: "BERT Phishing (DOM)",
-    description: "Detects credential harvesting and phishing patterns in page content.",
-    size: "~67 MB",
-    dtype: "q8" as const,
-    priority: 3,
-  },
-  /** Layer 1D: BERT-small PII detection — scans form input for sensitive data leakage */
+  /** Layer 1C: PII token detector */
   PII_DETECTION: {
-    id: "gravitee-io/bert-small-pii-detection",
+    id: "Xenova/bert-base-NER",
     nickname: "PII Shield",
     description: "Detects personally identifiable information typed into form fields on risky pages.",
-    size: "~25 MB",
+    size: "~108 MB",
     dtype: "q8" as const,
-    priority: 4,
+    priority: 3,
   },
 } as const;
 
