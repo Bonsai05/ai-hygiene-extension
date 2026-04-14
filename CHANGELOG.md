@@ -10,9 +10,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Email/SMS phishing detection via DistilBERT content classifier
-- Visual badge showcase page in the extension popup
+- Visual badge showcase in the extension popup
 - Export activity report as PDF
+- macOS/Linux support for Native Messaging host
+
+---
+
+## [2.0.0] — 2026-04-15
+
+### Breaking Changes
+- **Backend is now mandatory.** Run `api/setup.bat` once to register the Native Messaging bridge. The extension will show a `setup_required` banner until this is done.
+- `src/lib/daemon-manager.ts` (Ollama/LM Studio integration) removed — replaced by the built-in FastAPI backend.
+
+### Added
+- **Mandatory FastAPI backend** (`api/main.py`) — 7 lightweight ML models (ScamLLM, BERT phishing, PII detection, spam) running via ONNX Runtime + DirectML for NPU/GPU acceleration.
+- **Native Messaging bridge** (`api/host.py`, `api/com.ai_hygiene.json`) — backend auto-starts in a visible terminal window when the extension loads, showing a live ASCII hardware utilization monitor.
+- **One-time `setup.bat`** — installs Python deps, writes the Native Messaging manifest, registers the Windows Registry key, and prompts for Extension ID.
+- **7-model ensemble endpoint** (`POST /analyze/ensemble`) — weighted vote across all 7 models, returning combined score, level, individual model scores, and PII scan result.
+- **Heavy LLM download toggle** — Settings page allows downloading and loading a generative LLM (Qwen 2.5 1.5B, DeepSeek R1, Phi-4 Mini, Gemma 4) for deep threat reasoning. Includes real-time download progress bar.
+- **Backend status banners** in Popup — colour-coded banners show `starting` (yellow), `setup_required` (red), `offline` (grey), and model loading progress.
+- **PII real-time monitor** — content script monitors form field inputs and sends them to `POST /analyze/pii` for entity detection.
+- **`/heavy/status` polling** — background.ts polls for heavy model loading progress and broadcasts `heavyModelStatus` events to Settings UI.
+
+### Fixed
+- **Critical — False positives:** Warning banners now require ML confirmation (score ≥ 35) or an absolute heuristic danger signal (typosquatting, IP host, data URI, `@` in URL). Plain `http://` sites without other signals are never flagged.
+- **Critical — XP bar broken at level boundaries:** `Popup.tsx` switched from `xpInLevel()` to `xpProgressInLevel()` which correctly handles the boundary case where `xp === level × XP_PER_LEVEL`.
+- **`getDashboardData` missing fields:** The response now includes `modelsReady` and `modelsTotal` so the Popup loading indicator works correctly on open.
+- **`getModelStatus` backward compat:** Legacy handler preserved so older Settings code does not crash during transition.
+
+### Changed
+- `background.ts` — complete rewrite. Native Messaging replaces the old Ollama daemon. `queryBackendEnsemble()` replaces `analyzeUrlWithOffscreenML()`.
+- `Settings.tsx` — complete rewrite with live backend model table, heavy LLM selector, progress bar, and offline setup guide card.
+- `ARCHITECTURE.md` — rewritten to reflect v2.0 backend-first topology.
+- `nativeMessaging` added to `manifest.json` permissions.
+
+### Removed
+- `src/lib/daemon-manager.ts` — Ollama/LM Studio/Lemonade integration (replaced by FastAPI backend)
+- `src/lib/analysis-strategy.ts` — all functions were `@deprecated` and unused in production
+- `src/popup/components/figma/` — Figma design artefacts directory
+- `src/popup/components/ui/RiskStatus.tsx` — empty re-export stub
+- `postcss.config.js` — duplicate of `postcss.config.mjs`
+- `test-inline.mjs`, `test-inline2.mjs` — debug scratch scripts
 
 ---
 

@@ -11,7 +11,7 @@ import { ThreatList } from "./components/ThreatList";
 import { SettingsPage } from "./pages/Settings";
 import { OnboardingPage } from "./pages/Onboarding";
 import type { UserStats } from "../lib/storage";
-import { getLevelTitle, xpInLevel } from "../lib/storage";
+import { getLevelTitle, xpProgressInLevel } from "../lib/storage";
 import { XP_PER_LEVEL } from "../lib/constants";
 
 interface XpToast {
@@ -34,11 +34,17 @@ export default function Popup() {
   const [xpToast, setXpToast] = useState<XpToast | null>(null);
   const [levelUpToast, setLevelUpToast] = useState<LevelUpToast | null>(null);
   const [threats, setThreats] = useState<string[]>([]);
+  const [backendStatus, setBackendStatus] = useState<string>("starting");
+  const [backendModelsReady, setBackendModelsReady] = useState(0);
+  const [backendModelsTotal, setBackendModelsTotal] = useState(7);
 
   const loadData = useCallback(async () => {
     try {
       const res = await chrome.runtime.sendMessage({ type: "getDashboardData" });
       if (res?.stats) setStats(res.stats);
+      if (res?.backendStatus) setBackendStatus(res.backendStatus);
+      if (typeof res?.modelsReady === "number") setBackendModelsReady(res.modelsReady);
+      if (typeof res?.modelsTotal === "number") setBackendModelsTotal(res.modelsTotal);
     } catch {}
     finally { setLoading(false); }
   }, []);
@@ -77,6 +83,11 @@ export default function Popup() {
       if (msg.type === "mlRiskResult" && Array.isArray(msg.threats)) {
         setThreats(msg.threats as string[]);
       }
+      if (msg.type === "backendStatus") {
+        setBackendStatus(msg.status as string);
+        if (typeof msg.modelsReady === "number") setBackendModelsReady(msg.modelsReady as number);
+        if (typeof msg.modelsTotal === "number") setBackendModelsTotal(msg.modelsTotal as number);
+      }
     };
     chrome.runtime.onMessage.addListener(handler);
     return () => chrome.runtime.onMessage.removeListener(handler);
@@ -110,7 +121,8 @@ export default function Popup() {
   if (showOnboarding) return <OnboardingPage onComplete={() => setShowOnboarding(false)} />;
   if (showSettings) return <SettingsPage onBack={() => setShowSettings(false)} />;
 
-  const xpCurrent = xpInLevel(stats.xp);
+  // FIXED: xpProgressInLevel handles the exact boundary case (e.g. 100 XP shows full bar, not empty)
+  const { current: xpCurrent } = xpProgressInLevel(stats.xp, stats.level);
   const levelTitle = getLevelTitle(stats.level);
 
   return (
@@ -133,6 +145,37 @@ export default function Popup() {
           &#9881;
         </button>
       </div>
+
+      {/* ── Backend Status Banner ─────────────────────────────────────────── */}
+      {backendStatus === "setup_required" && (
+        <div className="bg-red-600 text-white text-xs font-bold px-4 py-2 flex items-center gap-2 border-b-2 border-border flex-shrink-0">
+          <span>⚠️</span>
+          <div className="flex-1">
+            <span>Backend setup required.</span>{" "}
+            <a href="#" onClick={(e) => { e.preventDefault(); chrome.tabs.create({ url: "chrome://extensions" }); }}
+               className="underline cursor-pointer">Open api/setup.bat</a>
+            {" "}to install.
+          </div>
+        </div>
+      )}
+      {backendStatus === "starting" && (
+        <div className="bg-yellow-500 text-white text-xs font-bold px-4 py-2 flex items-center gap-2 border-b-2 border-border flex-shrink-0">
+          <div className="size-3 border-2 border-white border-t-transparent rounded-full animate-spin flex-shrink-0" />
+          <span>Backend starting… Loading {backendModelsTotal} ML models</span>
+        </div>
+      )}
+      {backendStatus === "ready" && backendModelsReady < backendModelsTotal && (
+        <div className="bg-blue-600 text-white text-xs font-medium px-4 py-1.5 flex items-center gap-2 border-b border-border flex-shrink-0">
+          <div className="size-3 border-2 border-white border-t-transparent rounded-full animate-spin flex-shrink-0" />
+          <span>Models loading: {backendModelsReady}/{backendModelsTotal}</span>
+        </div>
+      )}
+      {backendStatus === "offline" && (
+        <div className="bg-gray-700 text-white text-xs font-medium px-4 py-1.5 flex items-center gap-2 border-b border-border flex-shrink-0">
+          <span>📡</span>
+          <span>Backend offline — heuristic mode active</span>
+        </div>
+      )}
 
       {/* ── Scrollable content ─────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-4 bg-[#f8f9fa]">

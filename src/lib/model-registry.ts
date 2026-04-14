@@ -1,6 +1,7 @@
 // src/lib/model-registry.ts
-// Single source of truth for all local ONNX model identifiers, metadata,
-// and status types. Imported by offscreen.ts, background.ts, and Settings UI.
+// Single source of truth for model status types and storage key.
+// Used by background.ts (model status tracking) and Settings UI.
+// NOTE: v2 backend-first — offscreen Transformers.js is a dead fallback only.
 
 // ---------------------------------------------------------------------------
 // Model definitions (3 models; no TinyBERT per spec)

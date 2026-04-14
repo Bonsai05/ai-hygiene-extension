@@ -13,7 +13,8 @@
         "webNavigation",
         "scripting",
         "notifications",
-        "offscreen"
+        "offscreen",
+        "nativeMessaging"
     ],
     "host_permissions": [
         "<all_urls>"

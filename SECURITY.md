@@ -16,8 +16,7 @@ If you discover a security issue — including bypass techniques for the phishin
 
 ### How to Report
 
-Email: **security@your-org.example.com**  
-*(Replace this with your actual security contact address before publishing)*
+Email: **Atharv@Atharva.trade**  
 
 Include in your report:
 - A clear description of the vulnerability

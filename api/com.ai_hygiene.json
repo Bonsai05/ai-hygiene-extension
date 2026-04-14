@@ -1,0 +1,9 @@
+{
+  "name": "com.ai_hygiene",
+  "description": "AI Hygiene Companion — Local ML Backend Bridge",
+  "path": "PLACEHOLDER_REPLACED_BY_SETUP_BAT",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+  ]
+}

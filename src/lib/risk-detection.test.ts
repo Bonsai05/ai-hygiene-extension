@@ -101,7 +101,7 @@ describe("analyzePageContent", () => {
   });
 
   it("detects login forms", () => {
-    document.body.innerHTML = '<form><input type="text" name="username" /></form>';
+    document.body.innerHTML = '<form><input type="text" name="username" /><input type="password" name="password" /></form>';
     const signals = analyzePageContent();
     expect(signals.hasLoginForm).toBe(true);
   });

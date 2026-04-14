@@ -2,7 +2,7 @@
 
 # 🛡️ AI Hygiene Companion
 
-**A production-grade Chrome Extension for real-time, on-device protection against phishing, trackers, and social engineering — powered by a Dual-Layer AI pipeline and a gamified "Safe-to-Earn" reward system.**
+**A production-grade Chrome Extension for real-time, on-device protection against phishing, trackers, and social engineering — powered by a mandatory FastAPI backend running 7 ML models via DirectML/NPU, a two-tier inference pipeline, and a gamified "Safe-to-Earn" reward system.**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/your-org/ai-hygiene-extension/ci.yml?style=flat-square)](https://github.com/your-org/ai-hygiene-extension/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -17,7 +17,7 @@
 
 ## Overview
 
-Traditional browser security tools rely on static blocklists and cloud-based heuristics — both of which lag behind the rapid mutation rate of modern phishing campaigns and trackers. The **AI Hygiene Companion** runs entirely on-device, combining a lightweight ONNX inference engine with an optional AMD NPU-accelerated heavyweight model to deliver real-time, privacy-preserving threat detection with zero external telemetry.
+Traditional browser security tools rely on static blocklists and cloud-based heuristics — both of which lag behind the rapid mutation rate of modern phishing campaigns and trackers. The **AI Hygiene Companion v2.0** runs entirely on-device using a mandatory local FastAPI backend that continuously runs 7 ONNX/PyTorch ML models (ScamLLM, BERT phishing, PII detection, spam) via DirectML hardware acceleration. A full generative LLM (Qwen, Gemma, DeepSeek) can be optionally loaded from Settings. Zero browsing data ever leaves the machine.
 
 ---
 
@@ -25,55 +25,50 @@ Traditional browser security tools rely on static blocklists and cloud-based heu
 
 | Feature | Description |
 |---|---|
-| **Real-Time URL Analysis** | Detects phishing URLs using a locally executing ONNX model before the page fully renders |
-| **DOM Content Scanning** | Content scripts continuously analyse page text for credential-harvesting language, fake urgency, and dark patterns |
-| **Dual-Layer AI Pipeline** | Lightweight built-in WASM models for instant classification; opt-in heavyweight LLMs (Llama 3.2, DeepSeek R1) for deep de-obfuscation via a local NPU daemon |
-| **Shadow DOM Warning Banners** | Threat alerts are injected inside a ShadowRoot, making them tamper-proof even on malicious pages |
+| **7-Model ML Ensemble** | ScamLLM, BERT phishing (×2), PII detection, URL phishing, email phishing, spam — weighted vote ensemble running on the local FastAPI server |
+| **NPU / DirectML Acceleration** | ONNX Runtime + DirectML runs models on AMD/Intel/NVIDIA GPUs and NPUs (XDNA) — visible in Task Manager as real hardware load |
+| **Auto-Start Backend** | Native Messaging bridge (`host.py`) auto-starts the FastAPI server in a visible terminal on extension load — a live hardware monitor is shown |
+| **Heavy LLM Toggle** | Settings page downloads and loads a generative LLM (Qwen 2.5, DeepSeek R1, Phi-4, Gemma 4) on demand for deep threat reasoning |
+| **Zero False Positives** | Banners are only injected when ML confirms a threat (score ≥ 35) or absolute URL danger signals are present (typosquatting, IP host, data URI) |
+| **PII Real-Time Monitor** | Content script monitors form inputs and sends text to `/analyze/pii` for live entity detection |
 | **Safe-to-Earn Gamification** | Earn XP and badges for safe behaviour; receive penalties for bypassing threat warnings — all enforced via a mutex-locked state engine |
-| **Per-URL XP Awarding** | Every unique page navigation awards +5 XP — scrolling YouTube Shorts awards XP for each new video |
-| **Privacy First** | All inference runs locally. No browsing data, URLs, or page content is ever sent to an external server |
-| **Manifest V3 Compliant** | Built on ephemeral Service Workers and the Offscreen Document API in strict accordance with Chrome's MV3 spec |
+| **Privacy First** | All inference runs locally — no browsing data, URLs, or page content is ever sent to an external server |
 
 ---
 
 ## 🏗 Architecture
 
-The extension is built around a **split-compute pipeline** that resolves the tension between real-time performance and deep analytical capability.
+The extension is built around a **mandatory local FastAPI backend** — the primary ML engine — which runs 7 lightweight models continuously. A generative LLM is available as an opt-in Tier 2 layer.
 
 ```
- ┌─────────────────────────────────────────────────────────────────────────────┐
- │                         Chrome Browser Sandbox                              │
- │                                                                             │
- │  ┌─────────────────┐    messages     ┌──────────────────────────────┐       │
- │  │  content-script  │ ─────────────► │   background.ts (SW)         │       │
- │  │  (DOM scraper)   │                │   Orchestrator + Mutex State  │       │
- │  └─────────────────┘                └──────────┬───────────────────┘       │
- │                                                │ routes to                  │
- │                                    ┌───────────▼───────────┐               │
- │                                    │   offscreen.ts         │               │
- │                                    │   Transformers.js +    │               │
- │                                    │   ONNX WebGPU/WASM     │               │
- │                                    └───────────────────────┘               │
- └─────────────────────────────────────────────────────────────────────────────┘
-                                               │ optional localhost call
-                                               ▼
-                                  ┌─────────────────────────┐
-                                  │  Local NPU Daemon        │
-                                  │  (Lemonade / GAIA /      │
-                                  │   LM Studio)             │
-                                  │  Llama 3.2 · DeepSeek R1 │
-                                  │  AMD Ryzen™ AI NPU       │
-                                  └─────────────────────────┘
+ Browser Process
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │  ┌─────────────────┐  pageScanResult    ┌──────────────────────────┐ │
+ │  │ content-script  │ ─────────────────► │  background.ts (SW)      │ │
+ │  │ DOM scraper     │                    │  Message router          │ │
+ │  │ PII monitor     │ ◄─────────────────  │  Native Messaging client │ │
+ │  └─────────────────┘  injectBanner      └──────────┬───────────────┘ │
+ │                                                     │ Native Messaging │
+ │  ┌─────────────────┐                    ┌──────────▼───────────────┐ │
+ │  │ host.py bridge  │ ◄─────────────────  │  Popup / Settings (React)│ │
+ │  │ Spawns FastAPI  │                    └──────────────────────────┘ │
+ │  └────────┬────────┘                                                  │
+ └───────────│──────────────────────────────────────────────────────────┘
+             ▼
+  ┌────────────────────────────────────────────────────────┐
+  │  FastAPI Backend  http://127.0.0.1:8000                │
+  │                                                        │
+  │  Tier 1 (always-on): 7 Lightweight Models (ONNX RT)    │
+  │    url_phishing · scam_llm · bert_phishing · pii ·     │
+  │    bert_phishing_v2 · email_phishing · spam            │
+  │    Hardware: DirectML → CUDA → CPU                     │
+  │                                                        │
+  │  Tier 2 (on-demand): Heavy Generative LLM              │
+  │    Qwen 2.5 · DeepSeek R1 · Phi-4 · Gemma 4           │
+  └────────────────────────────────────────────────────────┘
 ```
 
-### Layer 1 — Lightweight Built-In Engine *(Zero Configuration)*
-
-Runs entirely inside the browser via the [Offscreen Document API](https://developer.chrome.com/docs/extensions/reference/offscreen/), which provides access to WebAssembly and WebGPU without violating MV3 restrictions.
-
-- **Model:** `pirocheto/phishing-url-detection` — a fast, ONNX-quantised model for lexical URL classification
-- **Execution:** WebGPU (primary) → WASM SIMD (fallback)
-- **Latency:** Sub-100ms URL classification before the page finishes loading
-- **Privacy:** Model weights are fetched from HuggingFace and cached locally in IndexedDB. Zero data leaves the device at inference time.
+For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**. Zero data leaves the device at inference time.
 
 ### Layer 2 — Heavyweight NPU Engine *(Opt-In)*
 
@@ -92,11 +87,13 @@ For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 | Layer | Technology |
 |---|---|
-| **Language** | TypeScript 5.2 |
+| **Language** | TypeScript 5.2 (extension) + Python 3.10+ (backend) |
 | **UI Framework** | React 18 |
 | **Build Tool** | Vite 5 + `@crxjs/vite-plugin` |
-| **ML Runtime** | `@huggingface/transformers` (Transformers.js v3) |
-| **ML Format** | ONNX via WASM / WebGPU |
+| **Backend** | FastAPI + Uvicorn |
+| **ML Runtime** | ONNX Runtime + DirectML (Tier 1), PyTorch CPU (ScamLLM), HuggingFace Transformers (Tier 2) |
+| **ML Format** | ONNX (DirectML / CUDA / CPU) + PyTorch `.pt` |
+| **Backend Lifecycle** | Chrome Native Messaging (`host.py`) — auto-start, visible terminal |
 | **Styling** | Tailwind CSS 3, Radix UI primitives |
 | **State Management** | `chrome.storage.local` + promise-based Mutex |
 | **Testing** | Vitest + jsdom |
@@ -109,31 +106,42 @@ For the full technical breakdown see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 ### Prerequisites
 
 - **Node.js** ≥ 18.0.0 and **npm** ≥ 9
+- **Python** ≥ 3.10 (for the local backend)
 - A Chromium-based browser (Chrome 116+)
-- *(Optional)* A local LLM daemon for NPU acceleration
+- Windows (for DirectML / Native Messaging; macOS/Linux planned)
 
-### Clone & Build
+### Step 1 — Clone & Build the Extension
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/your-org/ai-hygiene-extension.git
 cd ai-hygiene-extension
-
-# 2. Install dependencies
 npm install
-
-# 3. Build the extension
 npm run build
 ```
 
 The compiled extension is placed in the `dist/` directory.
 
-### Load as an Unpacked Extension
+### Step 2 — Load as an Unpacked Extension
 
-1. Open Chrome and navigate to `chrome://extensions`
-2. Enable **Developer mode** (toggle in the top-right corner)
-3. Click **Load unpacked**
-4. Select the `dist/` folder from this repository
+1. Open Chrome → `chrome://extensions`
+2. Enable **Developer mode** (top-right toggle)
+3. Click **Load unpacked** → select the `dist/` folder
+4. Note your **Extension ID** (shown on the extensions card)
+
+### Step 3 — Set Up the Backend (**Required**)
+
+```bat
+cd api
+setup.bat
+```
+
+The script will:
+1. Check Python and install pip dependencies (`fastapi`, `onnxruntime-directml`, `transformers`, etc.)
+2. Prompt you to enter your Extension ID
+3. Register the Native Messaging host in the Windows Registry
+4. Reload the extension — the backend auto-starts every time the extension loads
+
+> The 7 lightweight models (~400 MB total) are downloaded from HuggingFace on first run and cached locally.
 
 ### Development Mode (Hot Reload)
 
@@ -141,7 +149,7 @@ The compiled extension is placed in the `dist/` directory.
 npm run dev
 ```
 
-Vite watches for file changes and rebuilds automatically. Reload the extension in `chrome://extensions` after each rebuild during development.
+Vite watches for file changes and rebuilds automatically. Reload the extension after each rebuild.
 
 ### Running Tests
 
@@ -197,8 +205,9 @@ For the full badge catalogue and level titles see **[GAMIFICATION.md](GAMIFICATI
 
 Click the **⚙ gear icon** in the dashboard to access Settings:
 
-- **Lightweight Built-In Models** — toggle in-browser URL and content classification (enabled by default, zero config)
-- **Heavyweight Local NPU Daemon** — configure a local daemon URL (`http://127.0.0.1:8000`) for AMD NPU-accelerated LLM analysis
+- **Backend Status** — shows model loading progress (modelsReady / modelsTotal)
+- **Heavy Model** — select and download a generative LLM (Qwen 2.5, DeepSeek R1, Phi-4, Gemma 4) for deep threat reasoning
+- **Notifications** — toggle XP awards, threat alerts, and PII warnings
 
 ---
 
@@ -212,11 +221,17 @@ ai-hygiene-extension/
 │   │   └── feature_request.md
 │   └── PULL_REQUEST_TEMPLATE.md
 ├── public/                      # Static assets (icons, manifest base)
+├── api/                         # Local FastAPI backend (mandatory)
+│   ├── main.py                  # FastAPI server — 7 lightweight models + heavy LLM
+│   ├── host.py                  # Native Messaging bridge (Chrome → FastAPI)
+│   ├── com.ai_hygiene.json      # Native Messaging host manifest
+│   ├── setup.bat                # One-time Windows setup and Registry registration
+│   └── requirements.txt         # Python deps (fastapi, onnxruntime-directml, ...)
 ├── src/
 │   ├── lib/                     # Core business logic
-│   │   ├── analysis-strategy.ts # Domain caching and analysis orchestration
-│   │   ├── constants.ts         # XP rewards, badge definitions, default settings
+│   │   ├── constants.ts         # XP rewards, risk patterns, default settings
 │   │   ├── gamification.ts      # XP calculation and badge award functions
+│   │   ├── model-registry.ts    # Model status types (used by background + Settings)
 │   │   ├── notifications.ts     # Browser notification helpers
 │   │   ├── risk-detection.ts    # Heuristic URL and content risk scoring
 │   │   ├── storage.ts           # chrome.storage wrapper with mutex locking
@@ -225,11 +240,11 @@ ai-hygiene-extension/
 │   │   ├── components/          # Reusable UI components (XPBar, BadgeGrid, etc.)
 │   │   ├── pages/
 │   │   │   ├── Onboarding.tsx   # First-run onboarding flow
-│   │   │   └── Settings.tsx     # Extension settings panel
-│   │   └── Popup.tsx            # Root popup component
-│   ├── background.ts            # MV3 Service Worker — message router and state orchestrator
-│   ├── content-script.ts        # Page-injected DOM scanner
-│   └── offscreen.ts             # Isolated Transformers.js inference worker
+│   │   │   └── Settings.tsx     # Backend status, model table, heavy LLM toggle
+│   │   └── Popup.tsx            # Root popup (backend status banner, XP bar)
+│   ├── background.ts            # MV3 Service Worker — Native Messaging + ensemble API
+│   ├── content-script.ts        # Page-injected DOM + PII scanner
+│   └── offscreen.ts             # Dead fallback Transformers.js worker (not primary path)
 ├── ARCHITECTURE.md              # Comprehensive technical architecture documentation
 ├── CHANGELOG.md                 # Version history
 ├── CONTRIBUTING.md              # Contributor guide and coding rules
@@ -267,11 +282,14 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full terms.
 
 ## 🙏 Credits
 
-- [**pirocheto**](https://huggingface.co/pirocheto) — for the `phishing-url-detection` ONNX model
-- [**ONNX Community**](https://huggingface.co/onnx-community) — for maintaining quantised, browser-ready model distributions
-- [**Hugging Face**](https://huggingface.co/) — for Transformers.js, which makes in-browser ML inference possible
-- [**AMD**](https://www.amd.com/en/developer/resources/ryzen-ai-software.html) — for the Ryzen™ AI / XDNA NPU architecture and the GAIA open-source framework
-- The academic research documented in [`AI Hygiene Companion Chrome Extension.md`](AI%20Hygiene%20Companion%20Chrome%20Extension.md) that informed the dual-model threat detection strategy
+- [**phishbot**](https://huggingface.co/phishbot) — for the `ScamLLM` (RoBERTa-based scam/social engineering classifier)
+- [**ealvaradob**](https://huggingface.co/ealvaradob) — for `phishing-url-detection` and `bert-base-uncased-ft-phishing-urls`
+- [**ONNX Community**](https://huggingface.co/onnx-community) — for `bert-finetuned-phishing-ONNX` and quantised model distributions
+- [**gravitee-io**](https://huggingface.co/gravitee-io) — for `bert-small-pii-detection`
+- [**cybersectony**](https://huggingface.co/cybersectony) — for `phishing-email-detection-distilbert`
+- [**mrm8488**](https://huggingface.co/mrm8488) — for `bert-tiny-finetuned-sms-spam-detection`
+- [**Hugging Face**](https://huggingface.co/) — for the Transformers Python library and ONNX export pipeline
+- [**Microsoft**](https://github.com/microsoft/onnxruntime) — for ONNX Runtime and the DirectML execution provider
 
 ---
 
