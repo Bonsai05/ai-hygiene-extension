@@ -10,21 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Dedicated **Scanner page** (`src/popup/pages/ScannerPage.tsx`) with staged AMD NPU-style simulation UI and scenario logs.
-- Standalone model diagnostics surfaced in popup/settings when offscreen runtime or model load fails.
-- Explicit offscreen message namespace (`offscreen.downloadModels`, `offscreen.getModelStatus`, `offscreen.dismissModelPrompt`) for model-control requests.
+- Native Messaging backend bootstrap (`api/host.py`, `api/setup.bat`, `api/com.ai_hygiene.json`) so backend startup is automated after one-time setup.
+- Heavy model controls in Settings (`load`, `status`, `unload`) with progress tracking.
+- Popup backend status badge showing model readiness and provider details.
 
 ### Changed
-- Runtime architecture now defaults to **standalone offscreen-only model flow**.
-- Model registry updated to browser-compatible DistilBERT/BERT-NER baseline identifiers.
-- Model load flow now applies timeout-based failure handling to prevent silent idle/stuck states.
-- Docs aligned to standalone architecture and scanner UX.
+- Backend defaults to local FastAPI mode and continuously uses lightweight models.
+- Offscreen creation reason updated to use supported blob worker reason.
+- Dashboard XP progress now uses boundary-safe level progress calculation.
 
 ### Fixed
-- Fixed relay-loop risk in background model event forwarding by accepting model broadcasts only from offscreen sender.
-- Fixed `TypeError: Cannot read properties of undefined (reading 'local')` in offscreen runtime with guarded storage wrappers.
-- Fixed "Download / Retry Models" no-op path by surfacing request failures and wiring direct offscreen message routes.
-- Reduced aggressive warning escalation by requiring strict ML confidence before upgrading safe pages.
+- Reduced aggressive warning escalation by requiring a minimum ML confidence before upgrading safe pages to warning.
+- Addressed stale/manual backend setup UX by adding explicit setup-required status handling.
 
 ---
 
